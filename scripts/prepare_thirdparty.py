@@ -10,6 +10,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Sequence
@@ -167,13 +168,12 @@ def allow_mounted_git_checkouts(env: dict[str, str]) -> None:
     """Allow bind-mounted checkouts whose owner differs inside the container."""
     if not inside_container():
         return
-    try:
-        count = int(env.get("GIT_CONFIG_COUNT", "0"))
-    except ValueError:
-        count = 0
-    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
-    env[f"GIT_CONFIG_VALUE_{count}"] = "*"
-    env["GIT_CONFIG_COUNT"] = str(count + 1)
+    config_path = Path(tempfile.gettempdir()) / f"benchp2p-gitconfig-{os.getpid()}"
+    config_path.write_text("[safe]\n\tdirectory = *\n", encoding="utf-8")
+    # Git only honors safe.directory from protected config scopes. Pointing
+    # GIT_CONFIG_GLOBAL at a temporary file keeps the setting process-local
+    # while still covering pip/setuptools_scm subprocess git introspection.
+    env["GIT_CONFIG_GLOBAL"] = str(config_path)
 
 
 def load_manifest(path: Path) -> list[RepoSpec]:
