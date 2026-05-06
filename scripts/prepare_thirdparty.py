@@ -26,6 +26,14 @@ class RepoSpec:
     patches: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True)
+class BuildResult:
+    name: str
+    checkout: Path
+    wheels: tuple[Path, ...]
+    installed: bool
+
+
 def repo_root() -> Path:
     return Path(__file__).resolve().parents[1]
 
@@ -174,6 +182,7 @@ def build_and_install_wheel(
     dry_run: bool,
     skip_build: bool,
     skip_install: bool,
+    clean_wheelhouse: bool,
     timeout: int,
 ) -> list[Path]:
     build_dir = checkout / spec.build_path
@@ -183,6 +192,12 @@ def build_and_install_wheel(
     backend_wheelhouse = wheelhouse / spec.name
     backend_wheelhouse.mkdir(parents=True, exist_ok=True)
     before = time.time()
+
+    if clean_wheelhouse and not skip_build:
+        for old_wheel in backend_wheelhouse.glob("*.whl"):
+            print(f"Removing stale wheel before build: {old_wheel}", flush=True)
+            if not dry_run:
+                old_wheel.unlink()
 
     if not skip_build:
         run_command(
@@ -221,7 +236,12 @@ def build_and_install_wheel(
             reverse=True,
         )
     if not wheels:
-        raise RuntimeError(f"no wheel matched {spec.wheel_glob} for {spec.name}")
+        produced = sorted(path.name for path in backend_wheelhouse.glob("*.whl"))
+        detail = ", ".join(produced) if produced else "no wheel files produced"
+        raise RuntimeError(
+            f"{spec.name}: no wheel matched {spec.wheel_glob} under "
+            f"{backend_wheelhouse} ({detail})"
+        )
 
     if not skip_install:
         run_command(
@@ -240,6 +260,36 @@ def parse_backend_filter(value: str | None) -> set[str] | None:
     return {item.strip().lower() for item in value.split(",") if item.strip()}
 
 
+def selected_specs(specs: Sequence[RepoSpec], requested: set[str] | None) -> list[RepoSpec]:
+    known = {spec.name.lower() for spec in specs}
+    if requested is None:
+        return list(specs)
+    unknown = requested - known
+    if unknown:
+        raise SystemExit(
+            "unknown backend(s): "
+            + ",".join(sorted(unknown))
+            + ". Known backends: "
+            + ",".join(sorted(known))
+        )
+    return [spec for spec in specs if spec.name.lower() in requested]
+
+
+def print_summary(results: Sequence[BuildResult], skipped_install: bool) -> None:
+    print("\nThird-party wheel summary:")
+    if not results:
+        print("  (no wheels built)")
+        return
+    for result in results:
+        wheel_list = (
+            ", ".join(str(path) for path in result.wheels)
+            if result.wheels
+            else "(dry-run; no wheel file created)"
+        )
+        install_state = "not installed" if skipped_install else "installed"
+        print(f"  {result.name}: {install_state}; {wheel_list}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Prepare MORI, Mooncake, UCCL, and NIXL from public repos."
@@ -254,6 +304,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-clone", action="store_true")
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--skip-install", action="store_true")
+    parser.add_argument(
+        "--container-build",
+        action="store_true",
+        help="Build wheels for a runtime container; implies --skip-install",
+    )
+    parser.add_argument(
+        "--clean-wheelhouse",
+        action="store_true",
+        help="Remove existing wheels for each selected backend before building",
+    )
     return parser
 
 
@@ -269,43 +329,61 @@ def main(argv: Sequence[str] | None = None) -> int:
     requested = parse_backend_filter(args.backends)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    if args.container_build:
+        args.skip_install = True
+        env["BENCHP2P_CONTAINER_BUILD"] = "1"
 
-    specs = load_manifest(manifest)
-    if requested is not None:
-        specs = [spec for spec in specs if spec.name.lower() in requested]
+    specs = selected_specs(load_manifest(manifest), requested)
     if not specs:
         raise SystemExit("no third-party repos selected")
 
     print(f"Manifest: {manifest}")
     print(f"Third-party dir: {thirdparty_dir}")
     print(f"Wheelhouse: {wheelhouse}")
+    print(f"Selected backends: {', '.join(spec.name for spec in specs)}")
+    if args.container_build:
+        print("Container build mode: wheels are built but not installed here.")
     if args.dry_run:
         print("Dry-run mode: commands are printed but not executed.")
 
+    results: list[BuildResult] = []
     for spec in specs:
         print(f"\n==> {spec.name}: {spec.repo} @ {spec.ref}", flush=True)
-        checkout = ensure_checkout(
-            spec,
-            thirdparty_dir,
-            env,
-            args.dry_run,
-            args.skip_clone,
-            args.timeout,
-        )
-        wheels = build_and_install_wheel(
-            spec,
-            checkout,
-            wheelhouse,
-            args.python,
-            env,
-            args.dry_run,
-            args.skip_build,
-            args.skip_install,
-            args.timeout,
-        )
+        try:
+            checkout = ensure_checkout(
+                spec,
+                thirdparty_dir,
+                env,
+                args.dry_run,
+                args.skip_clone,
+                args.timeout,
+            )
+            wheels = build_and_install_wheel(
+                spec,
+                checkout,
+                wheelhouse,
+                args.python,
+                env,
+                args.dry_run,
+                args.skip_build,
+                args.skip_install,
+                args.clean_wheelhouse or args.container_build,
+                args.timeout,
+            )
+        except (RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise SystemExit(f"{spec.name}: failed to build wheel in {thirdparty_dir}: {exc}") from exc
         for wheel in wheels:
-            print(f"Installed wheel candidate: {wheel}")
+            print(f"Built wheel candidate: {wheel}")
+        results.append(
+            BuildResult(
+                name=spec.name,
+                checkout=checkout,
+                wheels=tuple(wheels),
+                installed=not args.skip_install,
+            )
+        )
 
+    print_summary(results, args.skip_install)
     print("\nThird-party preparation complete.")
     return 0
 

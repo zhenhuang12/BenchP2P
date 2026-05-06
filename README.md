@@ -76,7 +76,7 @@ python3 scripts/prepare_thirdparty.py
 
 Run all four default backends. In Slurm container mode,
 `scripts/container_prepare_thirdparty.py` runs first inside the container. It
-uses `scripts/prepare_thirdparty.py --skip-install` on rank 0, writes wheels
+uses `scripts/prepare_thirdparty.py --container-build` on rank 0, writes wheels
 into `3rdparty/wheelhouse/<backend>/`, and the other ranks wait for the build
 marker before installing the wheels in their own container process:
 

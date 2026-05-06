@@ -83,7 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.executable,
         "--timeout",
         str(args.timeout),
-        "--skip-install",
+        "--container-build",
     ]
     if args.skip_clone:
         command.append("--skip-clone")

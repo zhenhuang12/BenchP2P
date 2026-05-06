@@ -46,3 +46,16 @@ Clone/update, build wheels, and install them into the active Python environment:
 ```bash
 python3 scripts/prepare_thirdparty.py
 ```
+
+Build all selected wheel packages for a runtime container without installing
+them into the current Python environment:
+
+```bash
+python3 scripts/prepare_thirdparty.py --container-build
+```
+
+`--container-build` is what `scripts/container_prepare_thirdparty.py` uses
+inside Slurm runtime containers. It builds each selected backend into
+`3rdparty/wheelhouse/<backend>/`, skips the install step, and removes stale
+wheels for that backend before each build so old artifacts are not mistaken for
+fresh output.
