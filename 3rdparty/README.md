@@ -47,15 +47,18 @@ Clone/update, build wheels, and install them into the active Python environment:
 python3 scripts/prepare_thirdparty.py
 ```
 
-Build all selected wheel packages for a runtime container without installing
-them into the current Python environment:
+Build all selected wheel packages in the default runtime image
+`docker.io/rocm/primus:v26.2` without installing them into the host Python
+environment:
 
 ```bash
 python3 scripts/prepare_thirdparty.py --container-build
 ```
 
 `--container-build` is what `scripts/container_prepare_thirdparty.py` uses
-inside Slurm runtime containers. It builds each selected backend into
+inside Slurm runtime containers. From the submission host, it wraps itself with
+`docker run`; from inside a runtime container, pass `--container-runtime none`
+to perform the actual build directly. It builds each selected backend into
 `3rdparty/wheelhouse/<backend>/`, skips the install step, and removes stale
 wheels for that backend before each build so old artifacts are not mistaken for
 fresh output.

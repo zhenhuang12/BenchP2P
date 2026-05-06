@@ -50,6 +50,116 @@ def shell_join(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
+def inside_container() -> bool:
+    return (
+        os.environ.get("BENCHP2P_CONTAINER_BUILD_INNER") == "1"
+        or Path("/.dockerenv").exists()
+        or Path("/run/.containerenv").exists()
+    )
+
+
+def unique_mounts(paths: Sequence[Path]) -> list[str]:
+    mounts: list[str] = []
+    seen: set[str] = set()
+    for path in paths:
+        resolved = path.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        mounts.append(f"{key}:{key}")
+    return mounts
+
+
+def docker_container_build_command(
+    args: argparse.Namespace,
+    manifest: Path,
+    thirdparty_dir: Path,
+    wheelhouse: Path,
+) -> list[str]:
+    script = Path(__file__).resolve()
+    inner = [
+        args.container_python,
+        str(script),
+        "--manifest",
+        str(manifest),
+        "--thirdparty-dir",
+        str(thirdparty_dir),
+        "--wheelhouse",
+        str(wheelhouse),
+        "--python",
+        args.container_python,
+        "--timeout",
+        str(args.timeout),
+        "--container-build",
+        "--container-runtime",
+        "none",
+    ]
+    if args.backends:
+        inner.extend(["--backends", args.backends])
+    if args.skip_clone:
+        inner.append("--skip-clone")
+    if args.skip_build:
+        inner.append("--skip-build")
+    if args.clean_wheelhouse:
+        inner.append("--clean-wheelhouse")
+
+    command = [
+        args.docker_bin,
+        "run",
+        "--rm",
+        "--ipc=host",
+        "--network=host",
+        "--device=/dev/kfd",
+        "--device=/dev/dri",
+        "--device=/dev/infiniband",
+        "--cap-add=SYS_PTRACE",
+        "--cap-add=CAP_SYS_ADMIN",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--group-add",
+        "video",
+        "--privileged",
+        "--env",
+        "BENCHP2P_CONTAINER_BUILD_INNER=1",
+        "--workdir",
+        str(repo_root()),
+    ]
+    if args.docker_gpus:
+        command.extend(["--gpus", args.docker_gpus])
+    if args.docker_pull:
+        command.append("--pull=always")
+    for mount in unique_mounts(
+        [repo_root(), thirdparty_dir, wheelhouse.parent, manifest.parent]
+    ):
+        command.extend(["-v", mount])
+    if args.docker_mount_home:
+        command.extend(["-v", f"{Path.home()}:/root/home"])
+    if args.docker_extra_args:
+        command.extend(shlex.split(args.docker_extra_args))
+    command.extend([args.container_image, "bash", "-lc", shell_join(inner)])
+    return command
+
+
+def maybe_run_container_build_wrapper(
+    args: argparse.Namespace,
+    manifest: Path,
+    thirdparty_dir: Path,
+    wheelhouse: Path,
+) -> int | None:
+    if not args.container_build or args.container_runtime == "none" or inside_container():
+        return None
+    if args.container_runtime != "docker":
+        raise SystemExit(f"unsupported container runtime: {args.container_runtime}")
+    command = docker_container_build_command(args, manifest, thirdparty_dir, wheelhouse)
+    print("Running container wheel build in runtime image:", flush=True)
+    print("+ " + shell_join(command), flush=True)
+    if args.dry_run:
+        return 0
+    subprocess.run(command, cwd=repo_root(), check=True)
+    return 0
+
+
 def load_manifest(path: Path) -> list[RepoSpec]:
     data = json.loads(path.read_text(encoding="utf-8"))
     specs = []
@@ -307,8 +417,32 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--container-build",
         action="store_true",
-        help="Build wheels for a runtime container; implies --skip-install",
+        help=(
+            "Build wheels in the runtime container image when invoked on the host; "
+            "inside a container this only builds wheels and implies --skip-install"
+        ),
     )
+    parser.add_argument(
+        "--container-runtime",
+        choices=["docker", "none"],
+        default="docker",
+        help="Container runtime used by --container-build on the host",
+    )
+    parser.add_argument(
+        "--container-image",
+        default="docker.io/rocm/primus:v26.2",
+        help="Runtime image used by --container-build on the host",
+    )
+    parser.add_argument(
+        "--container-python",
+        default="python3",
+        help="Python executable used inside the runtime container",
+    )
+    parser.add_argument("--docker-bin", default="docker")
+    parser.add_argument("--docker-gpus", default="")
+    parser.add_argument("--docker-pull", action="store_true")
+    parser.add_argument("--docker-mount-home", action="store_true")
+    parser.add_argument("--docker-extra-args", default="")
     parser.add_argument(
         "--clean-wheelhouse",
         action="store_true",
@@ -326,6 +460,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.wheelhouse
         else thirdparty_dir / "wheelhouse"
     )
+    wrapper_result = maybe_run_container_build_wrapper(
+        args, manifest, thirdparty_dir, wheelhouse
+    )
+    if wrapper_result is not None:
+        return wrapper_result
+
     requested = parse_backend_filter(args.backends)
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"

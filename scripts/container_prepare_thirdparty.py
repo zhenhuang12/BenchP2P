@@ -84,6 +84,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--timeout",
         str(args.timeout),
         "--container-build",
+        "--container-runtime",
+        "none",
     ]
     if args.skip_clone:
         command.append("--skip-clone")

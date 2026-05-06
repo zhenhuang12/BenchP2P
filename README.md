@@ -67,8 +67,14 @@ python3 scripts/bench_p2p_compare.py --dry-run
 
 For Slurm container runs, the default is to clone/update third-party stacks and
 build wheels inside `docker.io/rocm/primus:v26.2`, not on the submission host.
-Use this host-side command only for local development or to pre-populate
-`3rdparty/`:
+You can build the wheelhouse in the same image without launching benchmarks:
+
+```bash
+python3 scripts/prepare_thirdparty.py --container-build
+```
+
+Use this host-side command only for local development in the active Python
+environment:
 
 ```bash
 python3 scripts/prepare_thirdparty.py
