@@ -28,9 +28,10 @@ BenchP2P separates orchestration into three layers:
 - `scripts/slurm_run_p2p.sh`: Slurm layer. It performs a single `srun`
   allocation, starts the runtime container on each task, and forwards one
   command into the container.
-- `scripts/container_run_p2p.py`: container layer. It installs
-  `3rdparty/wheelhouse/*/*.whl` inside the container and runs MORI, Mooncake,
-  UCCL, and NIXL sequentially under the same Slurm allocation.
+- `scripts/container_run_p2p.py`: container layer. Rank 0 builds third-party
+  wheels inside the runtime container, all ranks install those wheels from
+  `3rdparty/wheelhouse/*/*.whl`, then run MORI, Mooncake, UCCL, and NIXL
+  sequentially under the same Slurm allocation.
 
 ## Official Benchmark Mapping
 
@@ -61,20 +62,20 @@ Preview the commands without running GPU/RDMA workloads:
 python3 scripts/bench_p2p_compare.py --dry-run
 ```
 
-Prepare third-party stacks: clone/update `3rdparty/`, build wheels into
-`3rdparty/wheelhouse/<backend>/`, and install them into the active Python
-environment. **You must run this once (or whenever versions change) before
-`bench_p2p_compare.py` is invoked**, because the bench script will only
-*install* pre-built wheels, never build them:
+For Slurm container runs, the default is to clone/update third-party stacks and
+build wheels inside `docker.io/rocm/primus:v26.2`, not on the submission host.
+Use this host-side command only for local development or to pre-populate
+`3rdparty/`:
 
 ```bash
 python3 scripts/prepare_thirdparty.py
 ```
 
-Run all four default backends. The bench script picks up the wheels from
-`3rdparty/wheelhouse/` and `pip install`s them into the current environment
-before running benchmarks; if any required wheel is missing it stops with an
-error pointing back at `prepare_thirdparty.py`:
+Run all four default backends. In Slurm container mode, rank 0 runs
+`scripts/prepare_thirdparty.py` inside the container with `--skip-install`,
+writes wheels into `3rdparty/wheelhouse/<backend>/`, and the other ranks wait
+for the build marker before installing the wheels in their own container
+process:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -87,8 +88,7 @@ python3 scripts/bench_p2p_compare.py \
 The default launcher for real P2P is Slurm with two tasks across two nodes.
 The external CLI calls one Slurm script, and that script wraps each task with
 `docker run docker.io/rocm/primus:v26.2`. Inside the container,
-`container_run_p2p.py` installs the wheels from `3rdparty/wheelhouse/` and
-then runs every selected backend:
+`container_run_p2p.py` builds, installs, and then runs every selected backend:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -119,21 +119,25 @@ bash scripts/slurm_run_p2p.sh \
   --slurm-gres gpu:1
 ```
 
-In Slurm container mode, `scripts/prepare_thirdparty.py` builds wheels into
-`3rdparty/wheelhouse/<backend>/` ahead of time. The Slurm task preamble runs:
+In Slurm container mode, `scripts/prepare_thirdparty.py` runs inside the
+runtime container before benchmark execution. Rank 0 serializes the build with
+a wheelhouse lock, writes a per-job completion marker, and all ranks then run:
 
 ```bash
 python3 -m pip install --force-reinstall --no-deps 3rdparty/wheelhouse/*/*.whl
 ```
 
-inside `docker.io/rocm/primus:v26.2` before launching the test. The default
-container runtime is `docker`, so no Pyxis-specific `srun --container-image`
-option is emitted. Use `--slurm-container-runtime pyxis` only on clusters that
-support Pyxis/Enroot, or `--slurm-container-runtime none` to run directly on
-the Slurm allocation. Use `--slurm-container-mounts` for extra mounts,
-`--container-python` if the image uses a non-default Python,
-`--runtime-wheelhouse` to point at a different wheel cache, or
-`--skip-runtime-wheel-install` to disable runtime wheel installation.
+inside `docker.io/rocm/primus:v26.2` before launching the test. Pass
+`--no-prepare-thirdparty-in-container` to reuse an existing wheelhouse,
+`--prepare-thirdparty-skip-clone` to rebuild from existing checkouts, or
+`--prepare-thirdparty-timeout` for long builds. The default container runtime
+is `docker`, so no Pyxis-specific `srun --container-image` option is emitted.
+Use `--slurm-container-runtime pyxis` only on clusters that support
+Pyxis/Enroot, or `--slurm-container-runtime none` to run directly on the Slurm
+allocation. Use `--slurm-container-mounts` for extra mounts, `--container-python`
+if the image uses a non-default Python, `--runtime-wheelhouse` to point at a
+different wheel cache, or `--skip-runtime-wheel-install` to disable runtime
+wheel installation.
 
 The generated Docker command follows the ROCm/RDMA container pattern:
 `--ipc=host`, `--network=host`, `--device=/dev/kfd`, `--device=/dev/dri`,
@@ -158,8 +162,10 @@ python3 scripts/bench_p2p_compare.py \
 By default the script uses `BenchP2P/3rdparty` as the source root and reads
 wheels from `BenchP2P/3rdparty/wheelhouse/<backend>/`. Use
 `--skip-install-wheels` to reuse an already-installed environment, or
-`--wheelhouse <path>` / `--manifest <path>` to point at a different wheel
-cache. Use `--source-root`, `--uccl-script`, `--mori-script`,
+`--wheelhouse <path>` / `--manifest <path>` to point at a different wheel cache.
+In Slurm container mode, `--manifest`, `--source-root`, and
+`--runtime-wheelhouse` are forwarded into the container-side build. Use
+`--source-root`, `--uccl-script`, `--mori-script`,
 `--nixlbench-bin`, or `--mooncake-bench-bin` if the benchmark entries live
 elsewhere.
 

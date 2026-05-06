@@ -4,9 +4,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_ROOT="${REPO_ROOT}/3rdparty"
-WHEELHOUSE="${SOURCE_ROOT}/wheelhouse"
+WHEELHOUSE=""
+MANIFEST=""
 OUTPUT_DIR="${REPO_ROOT}/results/slurm_run"
 CONTAINER_RUNNER="${SCRIPT_DIR}/container_run_p2p.py"
+PREPARE_THIRDPARTY_SCRIPT="${SCRIPT_DIR}/prepare_thirdparty.py"
 
 BACKENDS="mori,mooncake,uccl,nixl"
 SIZES="256,1024,4096,16384,65536,262144,1048576,10485760,16777216,104857600"
@@ -45,6 +47,9 @@ DOCKER_MOUNT_HOME="0"
 DOCKER_EXTRA_ARGS=""
 
 ASYNC_API="0"
+PREPARE_THIRDPARTY_IN_CONTAINER="1"
+PREPARE_THIRDPARTY_TIMEOUT="3600"
+PREPARE_THIRDPARTY_SKIP_CLONE="0"
 SKIP_RUNTIME_WHEEL_INSTALL="0"
 MORI_BACKEND="rdma"
 MORI_TRANSFER_BATCH_SIZE="1"
@@ -69,8 +74,10 @@ while [[ $# -gt 0 ]]; do
     --repo-root) REPO_ROOT="$2"; shift 2 ;;
     --source-root) SOURCE_ROOT="$2"; shift 2 ;;
     --wheelhouse) WHEELHOUSE="$2"; shift 2 ;;
+    --manifest) MANIFEST="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --container-runner) CONTAINER_RUNNER="$2"; shift 2 ;;
+    --prepare-thirdparty-script) PREPARE_THIRDPARTY_SCRIPT="$2"; shift 2 ;;
     --backends) BACKENDS="$2"; shift 2 ;;
     --sizes) SIZES="$2"; shift 2 ;;
     --iters) ITERS="$2"; shift 2 ;;
@@ -104,6 +111,10 @@ while [[ $# -gt 0 ]]; do
     --docker-pull) DOCKER_PULL="1"; shift ;;
     --docker-mount-home) DOCKER_MOUNT_HOME="1"; shift ;;
     --async-api) ASYNC_API="1"; shift ;;
+    --prepare-thirdparty-in-container) PREPARE_THIRDPARTY_IN_CONTAINER="1"; shift ;;
+    --skip-container-wheel-build) PREPARE_THIRDPARTY_IN_CONTAINER="0"; shift ;;
+    --prepare-thirdparty-timeout) PREPARE_THIRDPARTY_TIMEOUT="$2"; shift 2 ;;
+    --prepare-thirdparty-skip-clone) PREPARE_THIRDPARTY_SKIP_CLONE="1"; shift ;;
     --skip-runtime-wheel-install) SKIP_RUNTIME_WHEEL_INSTALL="1"; shift ;;
     --mori-backend) MORI_BACKEND="$2"; shift 2 ;;
     --mori-transfer-batch-size) MORI_TRANSFER_BATCH_SIZE="$2"; shift 2 ;;
@@ -126,6 +137,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${MANIFEST}" ]]; then
+  MANIFEST="${SOURCE_ROOT}/manifest.json"
+fi
+if [[ -z "${WHEELHOUSE}" ]]; then
+  WHEELHOUSE="${SOURCE_ROOT}/wheelhouse"
+fi
+
 mkdir -p "${OUTPUT_DIR}"
 
 RUNNER=(
@@ -139,6 +157,9 @@ RUNNER=(
   --pair-startup-seconds "${PAIR_STARTUP_SECONDS}"
   --source-root "${SOURCE_ROOT}"
   --wheelhouse "${WHEELHOUSE}"
+  --manifest "${MANIFEST}"
+  --prepare-thirdparty-script "${PREPARE_THIRDPARTY_SCRIPT}"
+  --prepare-thirdparty-timeout "${PREPARE_THIRDPARTY_TIMEOUT}"
   --mori-backend "${MORI_BACKEND}"
   --mori-transfer-batch-size "${MORI_TRANSFER_BATCH_SIZE}"
   --nixlbench-bin "${NIXLBENCH_BIN}"
@@ -149,6 +170,8 @@ RUNNER=(
   --mooncake-duration "${MOONCAKE_DURATION}"
 )
 [[ "${ASYNC_API}" == "1" ]] && RUNNER+=(--async-api)
+[[ "${PREPARE_THIRDPARTY_IN_CONTAINER}" == "1" ]] && RUNNER+=(--prepare-thirdparty-in-container)
+[[ "${PREPARE_THIRDPARTY_SKIP_CLONE}" == "1" ]] && RUNNER+=(--prepare-thirdparty-skip-clone)
 [[ "${SKIP_RUNTIME_WHEEL_INSTALL}" == "1" ]] && RUNNER+=(--skip-runtime-wheel-install)
 [[ "${MORI_XGMI_MULTIPROCESS}" == "1" ]] && RUNNER+=(--mori-xgmi-multiprocess)
 [[ -n "${NIXL_ETCD_ENDPOINTS}" ]] && RUNNER+=(--nixl-etcd-endpoints "${NIXL_ETCD_ENDPOINTS}")
@@ -228,7 +251,7 @@ if [[ "${SLURM_CONTAINER_RUNTIME}" == "docker" ]]; then
     --privileged
     --env MASTER_ADDR --env MASTER_PORT
     --env RANK --env WORLD_SIZE --env LOCAL_RANK --env LOCAL_WORLD_SIZE
-    --env SLURM_PROCID --env SLURM_NTASKS --env SLURM_LOCALID --env SLURM_NTASKS_PER_NODE
+    --env SLURM_JOB_ID --env SLURM_PROCID --env SLURM_NTASKS --env SLURM_LOCALID --env SLURM_NTASKS_PER_NODE
     --workdir "${SLURM_CONTAINER_WORKDIR}"
   )
   [[ -n "${DOCKER_GPUS}" ]] && DOCKER+=(--gpus "${DOCKER_GPUS}")

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import re
 import select
@@ -26,6 +27,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--op-type", choices=["write", "read"], default="write")
     parser.add_argument("--source-root", required=True)
     parser.add_argument("--wheelhouse", required=True)
+    parser.add_argument("--manifest", required=True)
+    parser.add_argument("--prepare-thirdparty-script", required=True)
+    parser.add_argument("--prepare-thirdparty-in-container", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--prepare-thirdparty-timeout", type=int, default=3600)
+    parser.add_argument("--prepare-thirdparty-skip-clone", action="store_true")
     parser.add_argument("--skip-runtime-wheel-install", action="store_true")
     parser.add_argument("--pair-startup-seconds", type=float, default=2.0)
     parser.add_argument("--async-api", action="store_true")
@@ -74,6 +80,68 @@ def install_wheels(wheelhouse: Path) -> None:
         [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *wheels],
         check=True,
     )
+
+
+def prepare_marker_path(wheelhouse: Path, env: dict[str, str]) -> Path:
+    job_id = env.get("SLURM_JOB_ID") or env.get("BENCHP2P_JOB_ID") or "single"
+    return wheelhouse / f".benchp2p_prepare_{job_id}.done"
+
+
+def wait_for_prepare(marker: Path, timeout_s: int) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if marker.exists():
+            return
+        time.sleep(2.0)
+    raise SystemExit(f"Timed out waiting for container wheel build marker: {marker}")
+
+
+def prepare_thirdparty_in_container(args: argparse.Namespace, env: dict[str, str]) -> None:
+    wheelhouse = Path(args.wheelhouse).resolve()
+    wheelhouse.mkdir(parents=True, exist_ok=True)
+    marker = prepare_marker_path(wheelhouse, env)
+    lock_path = wheelhouse / ".benchp2p_prepare.lock"
+    rank = int(env["RANK"])
+
+    if rank != 0:
+        print(f"Waiting for rank 0 to build third-party wheels: {marker}", flush=True)
+        wait_for_prepare(marker, args.prepare_thirdparty_timeout)
+        return
+
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        pass
+
+    command = [
+        sys.executable,
+        str(Path(args.prepare_thirdparty_script).resolve()),
+        "--manifest",
+        str(Path(args.manifest).resolve()),
+        "--thirdparty-dir",
+        str(Path(args.source_root).resolve()),
+        "--wheelhouse",
+        str(wheelhouse),
+        "--backends",
+        args.backends,
+        "--python",
+        sys.executable,
+        "--timeout",
+        str(args.prepare_thirdparty_timeout),
+        "--skip-install",
+    ]
+    if args.prepare_thirdparty_skip_clone:
+        command.append("--skip-clone")
+
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        print(f"Acquiring container wheel build lock: {lock_path}", flush=True)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            run(command, env, Path(args.source_root).resolve())
+            marker.write_text(f"built_at={time.time()}\n", encoding="utf-8")
+            print(f"Container wheel build complete: {marker}", flush=True)
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def env_with_dist() -> dict[str, str]:
@@ -439,6 +507,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"master={env.get('MASTER_ADDR', '')}",
         flush=True,
     )
+    if args.prepare_thirdparty_in_container:
+        prepare_thirdparty_in_container(args, env)
     if not args.skip_runtime_wheel_install:
         install_wheels(wheelhouse)
 

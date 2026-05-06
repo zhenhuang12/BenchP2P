@@ -191,10 +191,14 @@ def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> lis
         str(Path(args.source_root).resolve()),
         "--wheelhouse",
         str(Path(args.runtime_wheelhouse).resolve()),
+        "--manifest",
+        str(Path(args.manifest).resolve()),
         "--output-dir",
         str(output_dir.resolve()),
         "--container-runner",
         str(runner),
+        "--prepare-thirdparty-script",
+        str(Path(args.prepare_thirdparty_script).resolve()),
         "--backends",
         args.backends,
         "--sizes",
@@ -245,6 +249,7 @@ def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> lis
         ("--slurm-extra-args", args.slurm_extra_args),
         ("--docker-gpus", args.docker_gpus),
         ("--docker-extra-args", args.docker_extra_args),
+        ("--prepare-thirdparty-timeout", str(args.prepare_thirdparty_timeout)),
         ("--mori-backend", args.mori_backend),
         ("--mori-transfer-batch-size", str(args.mori_transfer_batch_size)),
         ("--nixlbench-bin", args.nixlbench_bin),
@@ -265,6 +270,12 @@ def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> lis
             command.extend([flag, value])
     if args.async_api:
         command.append("--async-api")
+    if args.prepare_thirdparty_in_container:
+        command.append("--prepare-thirdparty-in-container")
+    else:
+        command.append("--skip-container-wheel-build")
+    if args.prepare_thirdparty_skip_clone:
+        command.append("--prepare-thirdparty-skip-clone")
     if args.skip_runtime_wheel_install:
         command.append("--skip-runtime-wheel-install")
     if args.docker_pull:
@@ -623,6 +634,8 @@ def docker_run_command(args: argparse.Namespace, body: str) -> list[str]:
         "LOCAL_RANK",
         "--env",
         "LOCAL_WORLD_SIZE",
+        "--env",
+        "SLURM_JOB_ID",
         "--env",
         "SLURM_PROCID",
         "--env",
@@ -1574,6 +1587,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--container-runner",
         default=str(Path(__file__).resolve().with_name("container_run_p2p.py")),
     )
+    parser.add_argument(
+        "--prepare-thirdparty-script",
+        default=str(Path(__file__).resolve().with_name("prepare_thirdparty.py")),
+    )
     parser.add_argument("--source-root", default=str(default_source_root()))
     parser.add_argument("--thirdparty-dir", default=str(default_thirdparty_dir()))
     parser.add_argument("--output-dir", default=None)
@@ -1626,6 +1643,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--runtime-wheelhouse",
         default=None,
         help="Wheelhouse path installed inside Slurm runtime containers",
+    )
+    parser.add_argument(
+        "--prepare-thirdparty-in-container",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Build third-party wheels inside Slurm runtime containers before benchmarks",
+    )
+    parser.add_argument(
+        "--prepare-thirdparty-timeout",
+        type=int,
+        default=3600,
+        help="Per-command timeout for container-side third-party wheel builds",
+    )
+    parser.add_argument(
+        "--prepare-thirdparty-skip-clone",
+        action="store_true",
+        help="Container-side prepare step reuses existing third-party checkouts",
     )
     parser.add_argument(
         "--skip-runtime-wheel-install",
