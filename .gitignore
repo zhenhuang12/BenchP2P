@@ -1,0 +1,8 @@
+3rdparty/Mooncake/
+3rdparty/mori/
+3rdparty/nixl/
+3rdparty/uccl/
+3rdparty/wheelhouse/
+results/
+__pycache__/
+*.py[cod]

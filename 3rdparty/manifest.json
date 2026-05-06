@@ -1,0 +1,36 @@
+{
+  "repos": [
+    {
+      "name": "mori",
+      "repo": "https://github.com/ROCm/mori.git",
+      "ref": "main",
+      "path": "mori",
+      "build_path": ".",
+      "wheel_glob": "amd_mori-*.whl"
+    },
+    {
+      "name": "mooncake",
+      "repo": "https://github.com/kvcache-ai/Mooncake.git",
+      "ref": "main",
+      "path": "Mooncake",
+      "build_path": "mooncake-wheel",
+      "wheel_glob": "*mooncake*.whl"
+    },
+    {
+      "name": "uccl",
+      "repo": "https://github.com/uccl-project/uccl.git",
+      "ref": "main",
+      "path": "uccl",
+      "build_path": ".",
+      "wheel_glob": "uccl-*.whl"
+    },
+    {
+      "name": "nixl",
+      "repo": "https://github.com/ai-dynamo/nixl.git",
+      "ref": "main",
+      "path": "nixl",
+      "build_path": ".",
+      "wheel_glob": "nixl*.whl"
+    }
+  ]
+}
