@@ -156,8 +156,24 @@ def maybe_run_container_build_wrapper(
     print("+ " + shell_join(command), flush=True)
     if args.dry_run:
         return 0
-    subprocess.run(command, cwd=repo_root(), check=True)
+    try:
+        subprocess.run(command, cwd=repo_root(), check=True)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"container wheel build failed with exit code {exc.returncode}") from exc
     return 0
+
+
+def allow_mounted_git_checkouts(env: dict[str, str]) -> None:
+    """Allow bind-mounted checkouts whose owner differs inside the container."""
+    if not inside_container():
+        return
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    except ValueError:
+        count = 0
+    env[f"GIT_CONFIG_KEY_{count}"] = "safe.directory"
+    env[f"GIT_CONFIG_VALUE_{count}"] = "*"
+    env["GIT_CONFIG_COUNT"] = str(count + 1)
 
 
 def load_manifest(path: Path) -> list[RepoSpec]:
@@ -472,6 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.container_build:
         args.skip_install = True
         env["BENCHP2P_CONTAINER_BUILD"] = "1"
+        allow_mounted_git_checkouts(env)
 
     specs = selected_specs(load_manifest(manifest), requested)
     if not specs:
