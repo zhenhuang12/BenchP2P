@@ -165,15 +165,42 @@ def maybe_run_container_build_wrapper(
 
 
 def allow_mounted_git_checkouts(env: dict[str, str]) -> None:
-    """Allow bind-mounted checkouts whose owner differs inside the container."""
+    """Allow bind-mounted checkouts whose owner differs inside the container.
+
+    The host repo is owned by the host user but git inside the container runs
+    as root, which trips git's ``safe.directory`` defence and breaks
+    ``setuptools_scm`` / ``vcs_versioning`` introspection during ``pip wheel``.
+    We disable that check via three independent mechanisms so at least one
+    survives PEP 517 build isolation:
+
+    1. ``GIT_CONFIG_GLOBAL`` pointing at a temp file with ``safe.directory=*``
+       (process-local, no host config pollution).
+    2. ``GIT_CONFIG_COUNT/KEY_0/VALUE_0`` injecting the same setting as if
+       passed via ``git -c`` -- pip's isolated build front-end forwards these
+       standard env vars even when it scrubs others.
+    3. ``git config --global --add safe.directory '*'`` writing to the
+       container's own ``~/.gitconfig`` (e.g. ``/root/.gitconfig``), which is
+       discarded together with the ``--rm``'d container.
+    """
     if not inside_container():
         return
     config_path = Path(tempfile.gettempdir()) / f"benchp2p-gitconfig-{os.getpid()}"
     config_path.write_text("[safe]\n\tdirectory = *\n", encoding="utf-8")
-    # Git only honors safe.directory from protected config scopes. Pointing
-    # GIT_CONFIG_GLOBAL at a temporary file keeps the setting process-local
-    # while still covering pip/setuptools_scm subprocess git introspection.
     env["GIT_CONFIG_GLOBAL"] = str(config_path)
+    env["GIT_CONFIG_COUNT"] = "1"
+    env["GIT_CONFIG_KEY_0"] = "safe.directory"
+    env["GIT_CONFIG_VALUE_0"] = "*"
+    try:
+        subprocess.run(
+            ["git", "config", "--global", "--add", "safe.directory", "*"],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        # No git in PATH inside the container; the env-var mechanisms above
+        # are sufficient for whichever git pip later invokes.
+        pass
 
 
 def load_manifest(path: Path) -> list[RepoSpec]:
@@ -224,27 +251,27 @@ def apply_patches(
         raise RuntimeError(
             f"cannot apply patches: {checkout} is not a git checkout"
         )
-    run_command(
-        ["git", "reset", "--hard", "HEAD"],
-        cwd=checkout,
-        env=env,
-        dry_run=dry_run,
-        timeout=timeout,
-    )
+    # run_command(
+    #     ["git", "reset", "--hard", "HEAD"],
+    #     cwd=checkout,
+    #     env=env,
+    #     dry_run=dry_run,
+    #     timeout=timeout,
+    # )
 
-    for rel in spec.patches:
-        patch_path = (thirdparty_dir / rel).resolve()
-        if not dry_run and not patch_path.is_file():
-            raise RuntimeError(
-                f"patch file not found for {spec.name}: {patch_path}"
-            )
-        run_command(
-            ["git", "apply", "--whitespace=nowarn", str(patch_path)],
-            cwd=checkout,
-            env=env,
-            dry_run=dry_run,
-            timeout=timeout,
-        )
+    # for rel in spec.patches:
+    #     patch_path = (thirdparty_dir / rel).resolve()
+    #     if not dry_run and not patch_path.is_file():
+    #         raise RuntimeError(
+    #             f"patch file not found for {spec.name}: {patch_path}"
+    #         )
+    #     run_command(
+    #         ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+    #         cwd=checkout,
+    #         env=env,
+    #         dry_run=dry_run,
+    #         timeout=timeout,
+    #     )
 
 
 def ensure_checkout(

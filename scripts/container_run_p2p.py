@@ -39,6 +39,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--prepare-thirdparty-timeout", type=int, default=3600)
     parser.add_argument("--prepare-thirdparty-skip-clone", action="store_true")
     parser.add_argument("--skip-runtime-wheel-install", action="store_true")
+    parser.add_argument(
+        "--runtime-pip-packages",
+        default="prettytable",
+        help=(
+            "Comma-separated pure-python pip packages to install inside the "
+            "runtime container after wheelhouse install (e.g. 'prettytable' "
+            "for mori's benchmark.py). Pass an empty string to skip."
+        ),
+    )
     parser.add_argument("--pair-startup-seconds", type=float, default=2.0)
     parser.add_argument("--async-api", action="store_true")
     parser.add_argument("--mori-backend", choices=["rdma", "xgmi"], default="rdma")
@@ -86,6 +95,33 @@ def install_wheels(wheelhouse: Path) -> None:
         [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *wheels],
         check=True,
     )
+
+
+def install_runtime_pip_packages(packages_csv: str) -> None:
+    """Install pure-python runtime dependencies that aren't packaged as wheels.
+
+    For example mori's benchmark.py imports ``prettytable`` at module load
+    time but the project does not declare it. Failure is non-fatal: each
+    backend's run_* function will surface its own ImportError if a needed
+    package is missing.
+    """
+    packages = [item.strip() for item in packages_csv.split(",") if item.strip()]
+    if not packages:
+        return
+    print(
+        f"Installing runtime pip packages inside container: {', '.join(packages)}",
+        flush=True,
+    )
+    completed = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "--no-deps", *packages],
+        check=False,
+    )
+    if completed.returncode != 0:
+        print(
+            f"warning: runtime pip install exited {completed.returncode}; "
+            "continuing (backends may fail with ImportError later).",
+            flush=True,
+        )
 
 
 def run_container_prepare(args: argparse.Namespace, env: dict[str, str]) -> None:
@@ -427,7 +463,29 @@ def run_mooncake_tebench(args: argparse.Namespace, env: dict[str, str], cwd: Pat
             run(command, env, cwd)
 
 
-def run_mori(script: Path, args: argparse.Namespace, env: dict[str, str], cwd: Path) -> None:
+def run_mori(
+    script: Path, args: argparse.Namespace, env: dict[str, str], source_root: Path
+) -> None:
+    # mori's benchmark.py uses ``from tests.python.utils import ...`` which
+    # only resolves when the process runs from the mori repo root and that
+    # root is on PYTHONPATH. Default layout puts the repo at
+    # ``<source_root>/mori``; if a user pointed ``--mori-script`` somewhere
+    # else, derive the root from the script path.
+    mori_root = source_root / "mori"
+    if not (mori_root / "tests" / "python" / "utils.py").is_file():
+        try:
+            candidate = script.resolve().parents[3]  # io/ -> python/ -> tests/ -> mori/
+            if (candidate / "tests" / "python" / "utils.py").is_file():
+                mori_root = candidate
+        except IndexError:
+            pass
+
+    mori_env = dict(env)
+    existing_pp = mori_env.get("PYTHONPATH", "")
+    mori_env["PYTHONPATH"] = (
+        f"{mori_root}{os.pathsep}{existing_pp}" if existing_pp else str(mori_root)
+    )
+
     for size in args.sizes.split(","):
         command = [
             sys.executable,
@@ -451,14 +509,14 @@ def run_mori(script: Path, args: argparse.Namespace, env: dict[str, str], cwd: P
             command.extend(
                 [
                     "--host",
-                    env["MASTER_ADDR"],
+                    mori_env["MASTER_ADDR"],
                     "--num-initiator-dev",
                     "1",
                     "--num-target-dev",
                     "1",
                 ]
             )
-        run(command, env, cwd)
+        run(command, mori_env, mori_root)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -479,24 +537,62 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_container_prepare(args, env)
     if not args.skip_runtime_wheel_install:
         install_wheels(wheelhouse)
+    install_runtime_pip_packages(args.runtime_pip_packages)
 
-    for backend in [item.strip().lower() for item in args.backends.split(",") if item.strip()]:
+    backends = [
+        item.strip().lower() for item in args.backends.split(",") if item.strip()
+    ]
+    succeeded: list[str] = []
+    failed: list[tuple[str, str]] = []
+    for backend in backends:
         script = scripts.get(backend)
         if script is None:
-            raise SystemExit(f"unknown backend: {backend}")
+            failed.append((backend, "unknown backend"))
+            print(f"\n==> Skipping {backend}: unknown backend", flush=True)
+            continue
         if backend in {"uccl", "mori"} and not script.exists():
-            raise SystemExit(f"benchmark script not found for {backend}: {script}")
+            failed.append((backend, f"benchmark script not found: {script}"))
+            print(
+                f"\n==> Skipping {backend}: benchmark script not found: {script}",
+                flush=True,
+            )
+            continue
         print(f"\n==> Running {backend}", flush=True)
-        if backend == "uccl":
-            run_uccl(script, args, env, source_root)
-        elif backend == "nixl":
-            run_nixlbench(args, env, source_root)
-        elif backend == "mooncake":
-            run_mooncake_tebench(args, env, source_root)
-        elif backend == "mori":
-            run_mori(script, args, env, source_root)
+        try:
+            if backend == "uccl":
+                run_uccl(script, args, env, source_root)
+            elif backend == "nixl":
+                run_nixlbench(args, env, source_root)
+            elif backend == "mooncake":
+                run_mooncake_tebench(args, env, source_root)
+            elif backend == "mori":
+                run_mori(script, args, env, source_root)
+            else:
+                raise RuntimeError(f"unknown backend: {backend}")
+        except (subprocess.CalledProcessError, RuntimeError, OSError) as exc:
+            reason = (
+                f"exit code {exc.returncode}"
+                if isinstance(exc, subprocess.CalledProcessError)
+                else str(exc)
+            )
+            failed.append((backend, reason))
+            print(
+                f"!! {backend} failed ({reason}); continuing with remaining backends",
+                flush=True,
+            )
         else:
-            raise SystemExit(f"unknown backend: {backend}")
+            succeeded.append(backend)
+
+    print("\n==> Backend run summary", flush=True)
+    for backend in succeeded:
+        print(f"  ok       {backend}", flush=True)
+    for backend, reason in failed:
+        print(f"  FAIL     {backend}: {reason}", flush=True)
+    # Non-zero exit only when *every* requested backend failed; partial
+    # failures still let surrounding tooling collect logs from the ones
+    # that did run. Use --backends to retry just the failed ones.
+    if failed and not succeeded:
+        return 1
     return 0
 
 
