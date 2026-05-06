@@ -179,6 +179,107 @@ def backend_script_paths(source_root: Path, args: argparse.Namespace) -> dict[st
     }
 
 
+def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
+    script = Path(args.slurm_script).resolve()
+    runner = Path(args.container_runner).resolve()
+    command = [
+        "bash",
+        str(script),
+        "--repo-root",
+        str(Path(__file__).resolve().parents[1]),
+        "--source-root",
+        str(Path(args.source_root).resolve()),
+        "--wheelhouse",
+        str(Path(args.runtime_wheelhouse).resolve()),
+        "--output-dir",
+        str(output_dir.resolve()),
+        "--container-runner",
+        str(runner),
+        "--backends",
+        args.backends,
+        "--sizes",
+        ",".join(str(size) for size in args.sizes),
+        "--iters",
+        str(args.iters),
+        "--num-blocks",
+        str(args.num_blocks),
+        "--device",
+        args.device,
+        "--op-type",
+        args.op_type,
+        "--pair-startup-seconds",
+        str(args.pair_startup_seconds),
+        "--container-python",
+        args.container_python,
+        "--srun",
+        args.srun,
+        "--slurm-nodes",
+        str(args.slurm_nodes),
+        "--slurm-ntasks",
+        str(args.slurm_ntasks),
+        "--slurm-ntasks-per-node",
+        str(args.slurm_ntasks_per_node),
+        "--slurm-master-port",
+        str(args.slurm_master_port),
+        "--slurm-job-name",
+        args.slurm_job_name,
+        "--slurm-container-runtime",
+        args.slurm_container_runtime,
+        "--slurm-container-image",
+        args.slurm_container_image,
+        "--slurm-container-workdir",
+        args.slurm_container_workdir,
+        "--docker-bin",
+        args.docker_bin,
+    ]
+    optional_pairs = [
+        ("--slurm-partition", args.slurm_partition),
+        ("--slurm-account", args.slurm_account),
+        ("--slurm-qos", args.slurm_qos),
+        ("--slurm-time", args.slurm_time),
+        ("--slurm-constraint", args.slurm_constraint),
+        ("--slurm-gres", args.slurm_gres),
+        ("--slurm-gpus-per-task", args.slurm_gpus_per_task),
+        ("--slurm-cpus-per-task", args.slurm_cpus_per_task),
+        ("--slurm-container-mounts", args.slurm_container_mounts),
+        ("--slurm-extra-args", args.slurm_extra_args),
+        ("--docker-gpus", args.docker_gpus),
+        ("--docker-extra-args", args.docker_extra_args),
+        ("--mori-backend", args.mori_backend),
+        ("--mori-transfer-batch-size", str(args.mori_transfer_batch_size)),
+        ("--nixlbench-bin", args.nixlbench_bin),
+        ("--nixl-backend", args.nixl_backend),
+        ("--nixl-etcd-endpoints", args.nixl_etcd_endpoints),
+        ("--nixl-device-list", args.nixl_device_list),
+        ("--mooncake-bench-bin", args.mooncake_bench_bin),
+        ("--mooncake-backend", args.mooncake_backend),
+        ("--mooncake-xport-type", args.mooncake_xport_type),
+        ("--mooncake-duration", str(args.mooncake_duration)),
+        ("--uccl-script", args.uccl_script),
+        ("--nixl-script", args.nixl_script),
+        ("--mooncake-script", args.mooncake_script),
+        ("--mori-script", args.mori_script),
+    ]
+    for flag, value in optional_pairs:
+        if value:
+            command.extend([flag, value])
+    if args.async_api:
+        command.append("--async-api")
+    if args.skip_runtime_wheel_install:
+        command.append("--skip-runtime-wheel-install")
+    if args.docker_pull:
+        command.append("--docker-pull")
+    if args.docker_mount_home:
+        command.append("--docker-mount-home")
+    if args.mori_xgmi_multiprocess:
+        command.append("--mori-xgmi-multiprocess")
+    if not args.nixl_start_etcd:
+        command.append("--no-nixl-start-etcd")
+    if args.dry_run:
+        command.append("--dry-run")
+    return command
+
+
 def make_run_specs(args: argparse.Namespace, output_dir: Path) -> tuple[list[RunSpec], list[RunResult]]:
     source_root = Path(args.source_root).resolve()
     paths = backend_script_paths(source_root, args)
@@ -197,6 +298,17 @@ def make_run_specs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Run
 
     specs: list[RunSpec] = []
     skipped: list[RunResult] = []
+    if args.launcher == "slurm":
+        return [
+            RunSpec(
+                "slurm",
+                "slurm_all",
+                (tuple(make_slurm_script_command(args, output_dir)),),
+                source_root,
+                env.copy(),
+            )
+        ], skipped
+
     for backend in backends:
         script = paths.get(backend)
         if script is None:
@@ -978,6 +1090,10 @@ def parse_metrics(backend: str, text: str, source: str) -> list[Metric]:
             mori_metric = parse_mori_table_line(backend, line, source)
             if mori_metric is not None:
                 metrics.append(mori_metric)
+        elif backend in {"mooncake", "nixl"}:
+            table_metric = parse_official_table_line(backend, line, source)
+            if table_metric is not None:
+                metrics.append(table_metric)
     return metrics
 
 
@@ -993,6 +1109,32 @@ def parse_mori_table_line(backend: str, line: str, source: str) -> Metric | None
         gb_s = float(cells[4])
         latency_us = float(cells[6])
     except ValueError:
+        return None
+    return Metric(
+        backend=backend,
+        size_bytes=size,
+        gbps=gb_s * 8,
+        gb_s=gb_s,
+        latency_us=latency_us,
+        role="initiator",
+        batch_size=batch,
+        source=source,
+        raw_line=line.strip(),
+    )
+
+
+def parse_official_table_line(backend: str, line: str, source: str) -> Metric | None:
+    fields = line.strip().split()
+    if len(fields) < 4 or not fields[0].isdigit() or not fields[1].isdigit():
+        return None
+    try:
+        size = int(fields[0])
+        batch = int(fields[1])
+        gb_s = float(fields[2])
+        latency_us = float(fields[3])
+    except ValueError:
+        return None
+    if not math.isfinite(gb_s) or not math.isfinite(latency_us):
         return None
     return Metric(
         backend=backend,
@@ -1398,6 +1540,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--torchrun", default="torchrun")
+    parser.add_argument(
+        "--slurm-script",
+        default=str(Path(__file__).resolve().with_name("slurm_run_p2p.sh")),
+    )
+    parser.add_argument(
+        "--container-runner",
+        default=str(Path(__file__).resolve().with_name("container_run_p2p.py")),
+    )
     parser.add_argument("--source-root", default=str(default_source_root()))
     parser.add_argument("--thirdparty-dir", default=str(default_thirdparty_dir()))
     parser.add_argument("--output-dir", default=None)
@@ -1532,6 +1682,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="MORI IO transfer batch size; use 128 to match the MORI README example",
     )
     parser.add_argument("--mori-xgmi-multiprocess", action="store_true")
+    parser.add_argument(
+        "--nixlbench-bin",
+        default="nixlbench",
+        help="Official NIXLBench executable name or path",
+    )
+    parser.add_argument("--nixl-backend", default="UCX", help="NIXLBench backend, e.g. UCX")
+    parser.add_argument(
+        "--nixl-etcd-endpoints",
+        default=None,
+        help="ETCD endpoint for NIXLBench coordination; defaults to http://MASTER_ADDR:2379",
+    )
+    parser.add_argument(
+        "--nixl-start-etcd",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Start an ETCD server on Slurm rank 0 for NIXLBench",
+    )
+    parser.add_argument("--nixl-device-list", default=None)
+    parser.add_argument(
+        "--mooncake-bench-bin",
+        default="tebench",
+        help="Official Mooncake tebench executable name or path",
+    )
+    parser.add_argument(
+        "--mooncake-backend",
+        choices=["classic", "tent"],
+        default="tent",
+        help="Mooncake tebench backend",
+    )
+    parser.add_argument(
+        "--mooncake-xport-type",
+        default="rdma",
+        help="Mooncake tebench transport type when using the TENT backend",
+    )
+    parser.add_argument(
+        "--mooncake-duration",
+        type=int,
+        default=5,
+        help="Mooncake tebench measurement duration per size in seconds",
+    )
     parser.add_argument("--uccl-script", default=None)
     parser.add_argument("--nixl-script", default=None)
     parser.add_argument("--mooncake-script", default=None)

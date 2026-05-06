@@ -2,6 +2,7 @@
 3rdparty/mori/
 3rdparty/nixl/
 3rdparty/uccl/
+3rdparty/.benchp2p_runtime/
 3rdparty/wheelhouse/
 results/
 __pycache__/
