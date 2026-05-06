@@ -23,6 +23,7 @@ class RepoSpec:
     path: str
     build_path: str
     wheel_glob: str
+    patches: tuple[str, ...] = ()
 
 
 def repo_root() -> Path:
@@ -53,6 +54,7 @@ def load_manifest(path: Path) -> list[RepoSpec]:
                 path=item["path"],
                 build_path=item.get("build_path", "."),
                 wheel_glob=item.get("wheel_glob", "*.whl"),
+                patches=tuple(item.get("patches", ())),
             )
         )
     return specs
@@ -71,6 +73,46 @@ def run_command(
     subprocess.run(command, cwd=cwd, env=env, check=True, timeout=timeout)
 
 
+def apply_patches(
+    spec: RepoSpec,
+    checkout: Path,
+    thirdparty_dir: Path,
+    env: dict[str, str],
+    dry_run: bool,
+    timeout: int,
+) -> None:
+    if not spec.patches:
+        return
+
+    # Reset to a clean tree so re-running the script reapplies cleanly even
+    # when a previous run left the patch applied.
+    if not dry_run and not (checkout / ".git").exists():
+        raise RuntimeError(
+            f"cannot apply patches: {checkout} is not a git checkout"
+        )
+    run_command(
+        ["git", "reset", "--hard", "HEAD"],
+        cwd=checkout,
+        env=env,
+        dry_run=dry_run,
+        timeout=timeout,
+    )
+
+    for rel in spec.patches:
+        patch_path = (thirdparty_dir / rel).resolve()
+        if not dry_run and not patch_path.is_file():
+            raise RuntimeError(
+                f"patch file not found for {spec.name}: {patch_path}"
+            )
+        run_command(
+            ["git", "apply", "--whitespace=nowarn", str(patch_path)],
+            cwd=checkout,
+            env=env,
+            dry_run=dry_run,
+            timeout=timeout,
+        )
+
+
 def ensure_checkout(
     spec: RepoSpec,
     thirdparty_dir: Path,
@@ -81,6 +123,7 @@ def ensure_checkout(
 ) -> Path:
     checkout = thirdparty_dir / spec.path
     if skip_clone:
+        apply_patches(spec, checkout, thirdparty_dir, env, dry_run, timeout)
         return checkout
 
     thirdparty_dir.mkdir(parents=True, exist_ok=True)
@@ -118,6 +161,7 @@ def ensure_checkout(
         dry_run=dry_run,
         timeout=timeout,
     )
+    apply_patches(spec, checkout, thirdparty_dir, env, dry_run, timeout)
     return checkout
 
 
