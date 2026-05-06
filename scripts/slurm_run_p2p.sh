@@ -203,7 +203,13 @@ PREAMBLE='set -euo pipefail
 SLURM_PROCID="${SLURM_PROCID:-0}"
 SLURM_NTASKS="${SLURM_NTASKS:-1}"
 SLURM_LOCALID="${SLURM_LOCALID:-0}"
-MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sed -n '\''1p'\'')}"
+SLURM_NODELIST_VALUE="${SLURM_JOB_NODELIST:-${SLURM_NODELIST:-}}"
+if [[ -z "${MASTER_ADDR:-}" ]]; then
+  if [[ -n "${SLURM_NODELIST_VALUE}" ]] && command -v scontrol >/dev/null 2>&1; then
+    MASTER_ADDR="$(scontrol show hostnames "${SLURM_NODELIST_VALUE}" | sed -n '\''1p'\'')"
+  fi
+  MASTER_ADDR="${MASTER_ADDR:-$(hostname -f 2>/dev/null || hostname)}"
+fi
 MASTER_PORT="${MASTER_PORT:-'"${SLURM_MASTER_PORT}"'}"
 export MASTER_ADDR MASTER_PORT
 export RANK="${SLURM_PROCID}"
@@ -220,6 +226,9 @@ if [[ "${SLURM_CONTAINER_RUNTIME}" == "docker" ]]; then
     --security-opt seccomp=unconfined
     --group-add video
     --privileged
+    --env MASTER_ADDR --env MASTER_PORT
+    --env RANK --env WORLD_SIZE --env LOCAL_RANK --env LOCAL_WORLD_SIZE
+    --env SLURM_PROCID --env SLURM_NTASKS --env SLURM_LOCALID --env SLURM_NTASKS_PER_NODE
     --workdir "${SLURM_CONTAINER_WORKDIR}"
   )
   [[ -n "${DOCKER_GPUS}" ]] && DOCKER+=(--gpus "${DOCKER_GPUS}")
