@@ -27,15 +27,20 @@ Preview the commands without running GPU/RDMA workloads:
 python3 scripts/bench_p2p_compare.py --dry-run
 ```
 
-Prepare only: clone/update `3rdparty/`, build wheels, and install them into the
-active Python environment:
+Prepare third-party stacks: clone/update `3rdparty/`, build wheels into
+`3rdparty/wheelhouse/<backend>/`, and install them into the active Python
+environment. **You must run this once (or whenever versions change) before
+`bench_p2p_compare.py` is invoked**, because the bench script will only
+*install* pre-built wheels, never build them:
 
 ```bash
 python3 scripts/prepare_thirdparty.py
 ```
 
-Run all four default backends. This automatically runs
-`scripts/prepare_thirdparty.py` first:
+Run all four default backends. The bench script picks up the wheels from
+`3rdparty/wheelhouse/` and `pip install`s them into the current environment
+before running benchmarks; if any required wheel is missing it stops with an
+error pointing back at `prepare_thirdparty.py`:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -74,10 +79,13 @@ python3 scripts/bench_p2p_compare.py \
   --from-log nixl=/path/to/nixl.log
 ```
 
-By default the script uses `BenchP2P/3rdparty` as the source root. Use
-`--skip-prepare-thirdparty` to reuse an already prepared environment, or use
-`--source-root`, `--uccl-script`, `--nixl-script`, `--mooncake-script`, or
-`--mori-script` if the benchmark scripts live elsewhere.
+By default the script uses `BenchP2P/3rdparty` as the source root and reads
+wheels from `BenchP2P/3rdparty/wheelhouse/<backend>/`. Use
+`--skip-install-wheels` to reuse an already-installed environment, or
+`--wheelhouse <path>` / `--manifest <path>` to point at a different wheel
+cache. Use `--source-root`, `--uccl-script`, `--nixl-script`,
+`--mooncake-script`, or `--mori-script` if the benchmark scripts live
+elsewhere.
 
 ## Notes
 
