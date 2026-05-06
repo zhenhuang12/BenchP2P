@@ -51,13 +51,14 @@ python3 scripts/bench_p2p_compare.py \
 ```
 
 The default launcher for real P2P is Slurm with two tasks across two nodes.
-Slurm runs the benchmark tasks inside `docker.io/rocm/primus:v26.2`, installs
-the wheels from the run's `wheelhouse/` inside that runtime container, and then
-starts the backend benchmark:
+Slurm wraps each benchmark task with `docker run docker.io/rocm/primus:v26.2`,
+installs the wheels from `3rdparty/wheelhouse/` inside that runtime container,
+and then starts the backend benchmark:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
   --launcher slurm \
+  --slurm-container-runtime docker \
   --slurm-container-image docker.io/rocm/primus:v26.2 \
   --slurm-nodes 2 \
   --slurm-ntasks 2 \
@@ -80,9 +81,11 @@ In Slurm container mode, `scripts/prepare_thirdparty.py` builds wheels into
 python3 -m pip install --force-reinstall --no-deps 3rdparty/wheelhouse/*/*.whl
 ```
 
-inside `docker.io/rocm/primus:v26.2` before launching the test. The script
-auto-adds Pyxis-style `--container-image`, `--container-workdir`, and
-`--container-mounts` options. Use `--slurm-container-mounts` for extra mounts,
+inside `docker.io/rocm/primus:v26.2` before launching the test. The default
+container runtime is `docker`, so no Pyxis-specific `srun --container-image`
+option is emitted. Use `--slurm-container-runtime pyxis` only on clusters that
+support Pyxis/Enroot, or `--slurm-container-runtime none` to run directly on
+the Slurm allocation. Use `--slurm-container-mounts` for extra mounts,
 `--container-python` if the image uses a non-default Python,
 `--runtime-wheelhouse` to point at a different wheel cache, or
 `--skip-runtime-wheel-install` to disable runtime wheel installation.
@@ -109,9 +112,8 @@ elsewhere.
 
 - Use `--launcher local` only for dry-run, log parsing, or single-node smoke
   checks. Cross-node P2P performance should use `--launcher slurm`.
-- Slurm container mode assumes the cluster supports Pyxis/Enroot-style
-  `srun --container-image` options and that the output directory is on storage
-  visible to both allocated nodes.
+- Slurm container mode defaults to `docker run` inside each Slurm task. If your
+  cluster supports Pyxis/Enroot, pass `--slurm-container-runtime pyxis`.
 - UCCL is launched as two Slurm tasks with PyTorch distributed environment
   variables derived from `SLURM_PROCID` and `SLURM_NTASKS`.
 - NIXL and Mooncake are launched as one Slurm job where rank 0 runs the server

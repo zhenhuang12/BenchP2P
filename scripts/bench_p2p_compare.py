@@ -390,7 +390,7 @@ def slurm_srun_prefix(args: argparse.Namespace) -> list[str]:
     for flag, value in optional:
         if value:
             command.append(f"{flag}={value}")
-    if args.slurm_container_image and not args.no_slurm_container:
+    if args.slurm_container_runtime == "pyxis" and args.slurm_container_image:
         command.append(f"--container-image={args.slurm_container_image}")
         command.append(f"--container-workdir={args.slurm_container_workdir}")
         mounts = slurm_container_mounts(args)
@@ -476,7 +476,33 @@ def slurm_container_mounts(args: argparse.Namespace) -> str:
     return ",".join(mounts)
 
 
+def docker_run_command(args: argparse.Namespace, body: str) -> list[str]:
+    command = [
+        args.docker_bin,
+        "run",
+        "--rm",
+        "--network=host",
+        "--ipc=host",
+        "--privileged",
+        "--workdir",
+        args.slurm_container_workdir,
+    ]
+    if args.docker_gpus:
+        command.extend(["--gpus", args.docker_gpus])
+    if args.docker_pull:
+        command.append("--pull=always")
+    for mount in slurm_container_mounts(args).split(","):
+        if mount:
+            command.extend(["-v", mount])
+    if args.docker_extra_args:
+        command.extend(shlex.split(args.docker_extra_args))
+    command.extend([args.slurm_container_image, "bash", "-lc", body])
+    return command
+
+
 def make_slurm_command(args: argparse.Namespace, body: str) -> list[str]:
+    if args.slurm_container_runtime == "docker":
+        body = f"exec {shell_words(docker_run_command(args, body))}"
     return [*slurm_srun_prefix(args), "bash", "-lc", body]
 
 
@@ -1444,8 +1470,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slurm-gpus-per-task", default=None)
     parser.add_argument("--slurm-cpus-per-task", default=None)
     parser.add_argument("--slurm-job-name", default="benchp2p")
+    parser.add_argument(
+        "--slurm-container-runtime",
+        choices=["docker", "pyxis", "none"],
+        default="docker",
+        help="How Slurm tasks enter the runtime container",
+    )
     parser.add_argument("--slurm-container-image", default="docker.io/rocm/primus:v26.2")
-    parser.add_argument("--no-slurm-container", action="store_true")
+    parser.add_argument(
+        "--no-slurm-container",
+        action="store_const",
+        const="none",
+        dest="slurm_container_runtime",
+        help="Disable Slurm runtime container wrapping",
+    )
     parser.add_argument(
         "--slurm-container-mounts",
         default="",
@@ -1456,6 +1494,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=str(Path(__file__).resolve().parents[1]),
     )
     parser.add_argument("--container-python", default="python3")
+    parser.add_argument("--docker-bin", default="docker")
+    parser.add_argument("--docker-gpus", default="all")
+    parser.add_argument("--docker-pull", action="store_true")
+    parser.add_argument("--docker-extra-args", default="")
     parser.add_argument(
         "--slurm-extra-args",
         default="",
@@ -1501,7 +1543,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     use_slurm_container = (
         args.launcher == "slurm"
         and args.slurm_container_image
-        and not args.no_slurm_container
+        and args.slurm_container_runtime != "none"
     )
 
     if args.from_log:
