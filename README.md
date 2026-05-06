@@ -45,11 +45,15 @@ python3 scripts/bench_p2p_compare.py \
   --device gpu
 ```
 
-The default launcher for real P2P is Slurm with two tasks across two nodes:
+The default launcher for real P2P is Slurm with two tasks across two nodes.
+Slurm runs the benchmark tasks inside `docker.io/rocm/primus:v26.2`, installs
+the wheels from the run's `wheelhouse/` inside that runtime container, and then
+starts the backend benchmark:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
   --launcher slurm \
+  --slurm-container-image docker.io/rocm/primus:v26.2 \
   --slurm-nodes 2 \
   --slurm-ntasks 2 \
   --slurm-ntasks-per-node 1 \
@@ -63,6 +67,19 @@ Add scheduler-specific options with `--slurm-partition`, `--slurm-account`,
 `--slurm-extra-args`. In Slurm mode the script uses the first allocated
 hostname as `MASTER_ADDR`; rank 0 acts as server/initiator and rank 1 acts as
 client/target where the backend needs explicit roles.
+
+In Slurm container mode, `scripts/prepare_thirdparty.py` builds wheels into
+`<output-dir>/wheelhouse` before `srun`. The Slurm task preamble runs:
+
+```bash
+python3 -m pip install --force-reinstall --no-deps <output-dir>/wheelhouse/*/*.whl
+```
+
+inside `docker.io/rocm/primus:v26.2` before launching the test. The script
+auto-adds Pyxis-style `--container-image`, `--container-workdir`, and
+`--container-mounts` options. Use `--slurm-container-mounts` for extra mounts,
+`--container-python` if the image uses a non-default Python, or
+`--skip-runtime-wheel-install` to disable runtime wheel installation.
 
 Parse existing logs instead of launching benchmarks:
 
@@ -83,6 +100,9 @@ By default the script uses `BenchP2P/3rdparty` as the source root. Use
 
 - Use `--launcher local` only for dry-run, log parsing, or single-node smoke
   checks. Cross-node P2P performance should use `--launcher slurm`.
+- Slurm container mode assumes the cluster supports Pyxis/Enroot-style
+  `srun --container-image` options and that the output directory is on storage
+  visible to both allocated nodes.
 - UCCL is launched as two Slurm tasks with PyTorch distributed environment
   variables derived from `SLURM_PROCID` and `SLURM_NTASKS`.
 - NIXL and Mooncake are launched as one Slurm job where rank 0 runs the server

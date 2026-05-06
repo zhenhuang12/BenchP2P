@@ -390,6 +390,12 @@ def slurm_srun_prefix(args: argparse.Namespace) -> list[str]:
     for flag, value in optional:
         if value:
             command.append(f"{flag}={value}")
+    if args.slurm_container_image and not args.no_slurm_container:
+        command.append(f"--container-image={args.slurm_container_image}")
+        command.append(f"--container-workdir={args.slurm_container_workdir}")
+        mounts = slurm_container_mounts(args)
+        if mounts:
+            command.append(f"--container-mounts={mounts}")
     if args.slurm_extra_args:
         command.extend(shlex.split(args.slurm_extra_args))
     return command
@@ -413,6 +419,63 @@ def slurm_preamble(args: argparse.Namespace) -> str:
     )
 
 
+def slurm_runtime_install(args: argparse.Namespace) -> str:
+    if args.skip_runtime_wheel_install:
+        return ""
+    python = shell_token(args.container_python)
+    return "\n".join(
+        [
+            f"export BENCHP2P_WHEELHOUSE={shell_token(args.runtime_wheelhouse)}",
+            'if [ ! -d "${BENCHP2P_WHEELHOUSE}" ]; then',
+            '  echo "BenchP2P wheelhouse not found: ${BENCHP2P_WHEELHOUSE}" >&2',
+            "  exit 1",
+            "fi",
+            f"{python} - <<'PY'",
+            "import os",
+            "import subprocess",
+            "import sys",
+            "from pathlib import Path",
+            "",
+            'wheelhouse = Path(os.environ["BENCHP2P_WHEELHOUSE"])',
+            'wheels = sorted(str(path) for path in wheelhouse.glob("*/*.whl"))',
+            "if not wheels:",
+            '    raise SystemExit(f"No wheel files found under {wheelhouse}")',
+            'print("Installing BenchP2P wheelhouse inside runtime container:", flush=True)',
+            "for wheel in wheels:",
+            '    print(f"  {wheel}", flush=True)',
+            "subprocess.run(",
+            '    [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *wheels],',
+            "    check=True,",
+            ")",
+            "PY",
+        ]
+    )
+
+
+def slurm_body_prefix(args: argparse.Namespace) -> str:
+    parts = [slurm_preamble(args)]
+    install = slurm_runtime_install(args)
+    if install:
+        parts.append(install)
+    return "\n".join(parts)
+
+
+def slurm_container_mounts(args: argparse.Namespace) -> str:
+    mounts = []
+    for path_text in [
+        str(Path(__file__).resolve().parents[1]),
+        str(Path(args.source_root).resolve()),
+        str(Path(args.runtime_wheelhouse).resolve().parent),
+    ]:
+        path = Path(path_text).resolve()
+        mount = f"{path}:{path}"
+        if mount not in mounts:
+            mounts.append(mount)
+    if args.slurm_container_mounts:
+        mounts.extend(item for item in args.slurm_container_mounts.split(",") if item)
+    return ",".join(mounts)
+
+
 def make_slurm_command(args: argparse.Namespace, body: str) -> list[str]:
     return [*slurm_srun_prefix(args), "bash", "-lc", body]
 
@@ -421,7 +484,7 @@ def make_uccl_slurm_command(
     args: argparse.Namespace, script: Path, sizes_csv: str
 ) -> list[str]:
     command = [
-        args.python,
+        args.container_python,
         str(script),
         "--sizes",
         sizes_csv,
@@ -436,7 +499,7 @@ def make_uccl_slurm_command(
     ]
     if args.async_api:
         command.append("--async-api")
-    body = f"{slurm_preamble(args)}\nexec {shell_words(command)}"
+    body = f"{slurm_body_prefix(args)}\nexec {shell_words(command)}"
     return make_slurm_command(args, body)
 
 
@@ -461,7 +524,7 @@ def make_nixl_family_slurm_command(
         args.op_type,
     ]
     server = [
-        args.python,
+        args.container_python,
         *common,
         "--role",
         "server",
@@ -469,7 +532,7 @@ def make_nixl_family_slurm_command(
         args.server_bind_ip,
     ]
     client = [
-        args.python,
+        args.container_python,
         *common,
         "--role",
         "client",
@@ -478,7 +541,7 @@ def make_nixl_family_slurm_command(
     ]
     body = "\n".join(
         [
-            slurm_preamble(args),
+            slurm_body_prefix(args),
             'if [ "${SLURM_PROCID}" = "0" ]; then',
             f"  exec {shell_words(server)}",
             'elif [ "${SLURM_PROCID}" = "1" ]; then',
@@ -495,7 +558,7 @@ def make_mori_slurm_command(
     args: argparse.Namespace, script: Path, size: int
 ) -> list[str]:
     common = [
-        args.python,
+        args.container_python,
         str(script),
         "--backend",
         args.mori_backend,
@@ -530,7 +593,7 @@ def make_mori_slurm_command(
                 "1",
             ]
         )
-    body = f"{slurm_preamble(args)}\nexec {shell_words(common)}"
+    body = f"{slurm_body_prefix(args)}\nexec {shell_words(common)}"
     return make_slurm_command(args, body)
 
 
@@ -592,7 +655,12 @@ def run_prepare_thirdparty(args: argparse.Namespace, output_dir: Path) -> RunRes
         command.append("--skip-clone")
     if args.skip_thirdparty_build:
         command.append("--skip-build")
-    if args.skip_thirdparty_install:
+    if args.skip_thirdparty_install or (
+        args.launcher == "slurm"
+        and args.slurm_container_image
+        and not args.no_slurm_container
+        and not args.install_thirdparty_on_host
+    ):
         command.append("--skip-install")
 
     started = time.perf_counter()
@@ -1225,6 +1293,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-thirdparty-clone", action="store_true")
     parser.add_argument("--skip-thirdparty-build", action="store_true")
     parser.add_argument("--skip-thirdparty-install", action="store_true")
+    parser.add_argument(
+        "--install-thirdparty-on-host",
+        action="store_true",
+        help="Also install built wheels on the submission host in Slurm container mode",
+    )
+    parser.add_argument(
+        "--runtime-wheelhouse",
+        default=None,
+        help="Wheelhouse path installed inside Slurm runtime containers",
+    )
+    parser.add_argument(
+        "--skip-runtime-wheel-install",
+        action="store_true",
+        help="Do not install wheelhouse packages inside Slurm runtime tasks",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Only write generated commands")
     parser.add_argument(
         "--from-log",
@@ -1250,6 +1333,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slurm-gpus-per-task", default=None)
     parser.add_argument("--slurm-cpus-per-task", default=None)
     parser.add_argument("--slurm-job-name", default="benchp2p")
+    parser.add_argument("--slurm-container-image", default="docker.io/rocm/primus:v26.2")
+    parser.add_argument("--no-slurm-container", action="store_true")
+    parser.add_argument(
+        "--slurm-container-mounts",
+        default="",
+        help="Extra Pyxis container mounts appended to the generated mounts",
+    )
+    parser.add_argument(
+        "--slurm-container-workdir",
+        default=str(Path(__file__).resolve().parents[1]),
+    )
+    parser.add_argument("--container-python", default="python3")
     parser.add_argument(
         "--slurm-extra-args",
         default="",
@@ -1281,6 +1376,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.source_root = args.thirdparty_dir
     output_dir = Path(args.output_dir).resolve() if args.output_dir else output_dir_for(Path("results"))
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.runtime_wheelhouse is None:
+        args.runtime_wheelhouse = str((output_dir / "wheelhouse").resolve())
 
     run_results: list[RunResult] = []
     log_sources: list[tuple[str, Path]] = []
