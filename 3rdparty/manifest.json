@@ -22,7 +22,10 @@
       "ref": "main",
       "path": "uccl",
       "build_path": ".",
-      "wheel_glob": "uccl-*.whl"
+      "wheel_glob": "uccl-*.whl",
+      "patches": [
+        "patches/uccl-0001-relax-python-requires-to-3.10.patch"
+      ]
     },
     {
       "name": "nixl",
@@ -30,7 +33,10 @@
       "ref": "main",
       "path": "nixl",
       "build_path": ".",
-      "wheel_glob": "nixl*.whl"
+      "wheel_glob": "nixl*.whl",
+      "patches": [
+        "patches/nixl-0001-doca-telemetry-build-fixes.patch"
+      ]
     }
   ]
 }

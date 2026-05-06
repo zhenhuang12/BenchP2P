@@ -1,0 +1,24 @@
+Subject: [PATCH] Relax python_requires from >=3.12 to >=3.10
+
+Upstream uccl declares ``python_requires=">=3.12"`` in setup.py because
+nanobind's stable ABI (Py_LIMITED_API / cp312-abi3 wheels) needs Python
+3.12+. However, the existing code already falls back to a regular
+version-specific wheel when ``sys.version_info < (3, 12)`` (see the
+``_use_limited_api`` switch and the comment on the abi3 stub), so the
+build itself works on Python 3.10/3.11. Relax the metadata constraint
+so we can produce a cp310-cp310 wheel from this checkout.
+
+---
+diff --git a/setup.py b/setup.py
+index 04b4f1ca..93e6ebfd 100644
+--- a/setup.py
++++ b/setup.py
+@@ -68,7 +68,7 @@ setup(
+     classifiers=[
+         "Programming Language :: Python :: 3",
+     ],
+-    python_requires=">=3.12",
++    python_requires=">=3.10",
+     options={"bdist_wheel": {"py_limited_api": "cp312"}} if _use_limited_api else {},
+     extras_require={
+         "rocm": [],

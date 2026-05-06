@@ -1,0 +1,100 @@
+Subject: [PATCH] doca telemetry: gate plugin on metrics API + add nixl_common_dep
+
+The DOCA telemetry exporter plugin in NIXL has two build problems on
+hosts with an older DOCA SDK:
+
+1. ``doca_exporter.cpp`` includes ``common/configuration.h`` which pulls
+   in ``<toml++/toml.hpp>``. The tomlplusplus include path is exposed
+   through ``nixl_common_dep`` (declared in
+   ``src/utils/common/meson.build``) the same way the sibling
+   ``prometheus`` exporter wires it up, but the DOCA plugin's
+   ``meson.build`` only links ``nixl_infra``. Without ``nixl_common_dep``
+   the build fails with::
+
+       fatal error: toml++/toml.hpp: No such file or directory
+
+2. The plugin source uses the metrics-style API
+   (``doca_telemetry_exporter_metrics_create_context``,
+   ``doca_telemetry_exporter_metrics_add_constant_label``,
+   ``doca_telemetry_exporter_metrics_add_label_names``,
+   ``doca_telemetry_exporter_metrics_add_counter``,
+   ``doca_telemetry_exporter_metrics_add_gauge`` et al., plus the
+   ``doca_telemetry_exporter_label_set_id_t`` type) which was
+   introduced in newer DOCA releases. Older DOCA SDKs ship
+   ``doca_telemetry_exporter.h`` without those symbols, in which case
+   the plugin cannot compile.
+
+The current ``meson.build`` only checks that ``doca_telemetry_exporter.h``
+exists; we extend the probe to also require the metrics API, and skip
+the plugin with an actionable warning if the API is missing. We also add
+``nixl_common_dep`` to the plugin's dependency list so the toml++ include
+is propagated when the plugin *is* built.
+
+---
+diff --git a/src/plugins/telemetry/doca/meson.build b/src/plugins/telemetry/doca/meson.build
+index 5bb9422..d8e51f9 100644
+--- a/src/plugins/telemetry/doca/meson.build
++++ b/src/plugins/telemetry/doca/meson.build
+@@ -14,22 +14,35 @@
+ # limitations under the License.
+ 
+ doca_found = false
++doca_has_metrics_api = false
+ doca_base_path = '/opt/mellanox/doca'
+ doca_inc_path = doca_base_path / 'include'
+ doca_arch = host_machine.cpu_family() + '-linux-gnu'
+ doca_lib_path = doca_base_path / 'lib' / doca_arch
+ 
+ if cpp.has_header('doca_telemetry_exporter.h', args: '-I' + doca_inc_path)
+-    doca_dep = declare_dependency(
+-        include_directories: include_directories(doca_inc_path, is_system: true),
+-        link_args: [
+-            '-L' + doca_lib_path,
+-            '-ldoca_telemetry_exporter',
+-            '-ldoca_common',
+-            '-Wl,-rpath,' + doca_lib_path
+-        ]
++    # The plugin source uses the metrics-style API
++    # (doca_telemetry_exporter_metrics_create_context et al.) introduced in
++    # newer DOCA releases. Older DOCA SDKs ship doca_telemetry_exporter.h
++    # without those symbols, in which case the plugin cannot build. Probe
++    # for the label-set type to decide whether to enable it.
++    doca_has_metrics_api = cpp.has_type(
++        'doca_telemetry_exporter_label_set_id_t',
++        prefix: '#include <doca_telemetry_exporter.h>',
++        args: '-I' + doca_inc_path,
+     )
+-    doca_found = true
++    if doca_has_metrics_api
++        doca_dep = declare_dependency(
++            include_directories: include_directories(doca_inc_path, is_system: true),
++            link_args: [
++                '-L' + doca_lib_path,
++                '-ldoca_telemetry_exporter',
++                '-ldoca_common',
++                '-Wl,-rpath,' + doca_lib_path
++            ]
++        )
++        doca_found = true
++    endif
+ endif
+ 
+ if doca_found
+@@ -38,12 +51,16 @@ if doca_found
+         'doca_plugin.cpp',
+         'doca_exporter.cpp',
+         include_directories: [nixl_inc_dirs, utils_inc_dirs],
+-        dependencies: [nixl_infra, absl_log_dep, doca_dep],
++        dependencies: [nixl_infra, nixl_common_dep, absl_log_dep, doca_dep],
+         install: true,
+         install_dir: plugin_install_dir,
+         name_prefix: '',
+     )
+     message('Building DOCA telemetry exporter plugin')
++elif doca_has_metrics_api == false and cpp.has_header('doca_telemetry_exporter.h', args: '-I' + doca_inc_path)
++    warning('DOCA Telemetry Exporter headers found but lack the metrics API ' +
++            '(doca_telemetry_exporter_label_set_id_t). DOCA telemetry exporter ' +
++            'will not be built. Upgrade DOCA to a release that exposes the metrics API.')
+ else
+     warning('DOCA Telemetry Exporter headers not found. DOCA telemetry exporter will not be built.')
+ endif
