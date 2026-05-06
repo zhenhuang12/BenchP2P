@@ -481,8 +481,17 @@ def docker_run_command(args: argparse.Namespace, body: str) -> list[str]:
         args.docker_bin,
         "run",
         "--rm",
-        "--network=host",
         "--ipc=host",
+        "--network=host",
+        "--device=/dev/kfd",
+        "--device=/dev/dri",
+        "--device=/dev/infiniband",
+        "--cap-add=SYS_PTRACE",
+        "--cap-add=CAP_SYS_ADMIN",
+        "--security-opt",
+        "seccomp=unconfined",
+        "--group-add",
+        "video",
         "--privileged",
         "--workdir",
         args.slurm_container_workdir,
@@ -494,6 +503,8 @@ def docker_run_command(args: argparse.Namespace, body: str) -> list[str]:
     for mount in slurm_container_mounts(args).split(","):
         if mount:
             command.extend(["-v", mount])
+    if args.docker_mount_home:
+        command.extend(["-v", f"{Path.home()}:/root/home"])
     if args.docker_extra_args:
         command.extend(shlex.split(args.docker_extra_args))
     command.extend([args.slurm_container_image, "bash", "-lc", body])
@@ -1495,7 +1506,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--container-python", default="python3")
     parser.add_argument("--docker-bin", default="docker")
-    parser.add_argument("--docker-gpus", default="all")
+    parser.add_argument(
+        "--docker-gpus",
+        default="",
+        help="Optional Docker --gpus value. Empty by default for ROCm containers.",
+    )
+    parser.add_argument(
+        "--docker-mount-home",
+        action="store_true",
+        help="Mount the submitter home directory as /root/home inside the container",
+    )
     parser.add_argument("--docker-pull", action="store_true")
     parser.add_argument("--docker-extra-args", default="")
     parser.add_argument(

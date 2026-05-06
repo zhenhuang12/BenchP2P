@@ -90,6 +90,16 @@ the Slurm allocation. Use `--slurm-container-mounts` for extra mounts,
 `--runtime-wheelhouse` to point at a different wheel cache, or
 `--skip-runtime-wheel-install` to disable runtime wheel installation.
 
+The generated Docker command follows the ROCm/RDMA container pattern:
+`--ipc=host`, `--network=host`, `--device=/dev/kfd`, `--device=/dev/dri`,
+`--device=/dev/infiniband`, `--cap-add=SYS_PTRACE`,
+`--cap-add=CAP_SYS_ADMIN`, `--security-opt seccomp=unconfined`,
+`--group-add video`, and `--privileged`. Unlike a long-running dev container,
+BenchP2P does not use `-d ... sleep infinity`; each Slurm task runs the
+benchmark in the foreground so `srun` captures logs and exit status. Pass
+`--docker-mount-home` to add `-v $HOME:/root/home`, and
+`--docker-extra-args` for site-specific Docker options.
+
 Parse existing logs instead of launching benchmarks:
 
 ```bash
