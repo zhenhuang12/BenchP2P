@@ -631,45 +631,133 @@ def run_specs(
             results.append(run_single(spec, logs_dir, timeout_s))
     return results
 
+def _load_wheel_globs(manifest_path: Path) -> dict[str, str]:
+    """Return ``{backend_name_lower: wheel_glob}`` from the third-party manifest."""
+    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return {
+        item["name"].lower(): item.get("wheel_glob", "*.whl")
+        for item in data.get("repos", [])
+    }
 
-def run_prepare_thirdparty(args: argparse.Namespace, output_dir: Path) -> RunResult:
-    script = Path(__file__).resolve().with_name("prepare_thirdparty.py")
-    log_path = output_dir / "prepare_thirdparty.log"
-    command = [
-        args.python,
-        str(script),
-        "--thirdparty-dir",
-        str(Path(args.thirdparty_dir).resolve()),
-        "--backends",
-        args.backends,
-        "--wheelhouse",
-        str((output_dir / "wheelhouse").resolve()),
-        "--timeout",
-        str(args.prepare_timeout),
-        "--python",
-        args.python,
-    ]
-    if args.dry_run:
-        command.append("--dry-run")
-    if args.skip_thirdparty_clone:
-        command.append("--skip-clone")
-    if args.skip_thirdparty_build:
-        command.append("--skip-build")
-    if args.skip_thirdparty_install or (
-        args.launcher == "slurm"
-        and args.slurm_container_image
-        and not args.no_slurm_container
-        and not args.install_thirdparty_on_host
-    ):
-        command.append("--skip-install")
 
+def _find_backend_wheel(
+    wheelhouse: Path, backend: str, wheel_glob: str
+) -> Path | None:
+    backend_dir = wheelhouse / backend
+    candidates = sorted(
+        (path for path in backend_dir.glob(wheel_glob) if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def install_wheels_from_wheelhouse(
+    args: argparse.Namespace, output_dir: Path
+) -> RunResult:
+    """Install pre-built wheels for the requested backends from ``wheelhouse``.
+
+    The wheels themselves are produced by ``scripts/prepare_thirdparty.py``.
+    This function does not clone or build anything: if a wheel is missing it
+    fails fast with an actionable message pointing the user back at
+    ``prepare_thirdparty.py``.
+    """
     started = time.perf_counter()
-    status = "ok"
-    exit_code: int | None = None
-    error = ""
+    log_path = output_dir / "install_wheels.log"
+    manifest_path = Path(args.manifest).resolve()
+    wheelhouse = Path(args.wheelhouse).resolve()
+    backends = [
+        item.strip().lower() for item in args.backends.split(",") if item.strip()
+    ]
+
+    def _result(
+        status: str,
+        exit_code: int | None,
+        commands: list[list[str]],
+        error: str,
+    ) -> RunResult:
+        return RunResult(
+            "thirdparty",
+            "install-wheels",
+            status,
+            exit_code,
+            [str(log_path)],
+            [shell_join(cmd) for cmd in commands],
+            time.perf_counter() - started,
+            error,
+        )
+
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w", encoding="utf-8") as log_file:
-        log_file.write(f"$ {shell_join(command)}\n\n")
+        log_file.write(f"Manifest:   {manifest_path}\n")
+        log_file.write(f"Wheelhouse: {wheelhouse}\n")
+        log_file.write(f"Backends:   {','.join(backends) or '(none)'}\n\n")
+
+        try:
+            wheel_globs = _load_wheel_globs(manifest_path)
+        except FileNotFoundError:
+            error = (
+                f"manifest not found: {manifest_path}. "
+                "Run: python3 scripts/prepare_thirdparty.py"
+            )
+            log_file.write(f"ERROR: {error}\n")
+            return _result("failed", None, [], error)
+        except (OSError, json.JSONDecodeError) as exc:
+            error = f"failed to read manifest {manifest_path}: {exc}"
+            log_file.write(f"ERROR: {error}\n")
+            return _result("failed", None, [], error)
+
+        selected_wheels: list[Path] = []
+        missing: list[tuple[str, Path, str]] = []
+        for backend in backends:
+            wheel_glob = wheel_globs.get(backend)
+            if wheel_glob is None:
+                log_file.write(
+                    f"[{backend}] not declared in manifest, skipping wheel install\n"
+                )
+                continue
+            wheel = _find_backend_wheel(wheelhouse, backend, wheel_glob)
+            if wheel is None:
+                backend_dir = wheelhouse / backend
+                log_file.write(
+                    f"[{backend}] missing: no '{wheel_glob}' under {backend_dir}\n"
+                )
+                missing.append((backend, backend_dir, wheel_glob))
+            else:
+                log_file.write(f"[{backend}] selected {wheel}\n")
+                selected_wheels.append(wheel)
+
+        if missing:
+            backend_list = ",".join(name for name, _, _ in missing)
+            error = (
+                f"missing wheel(s) for: {backend_list}. "
+                "Build them with: "
+                f"python3 scripts/prepare_thirdparty.py --backends {backend_list}"
+            )
+            log_file.write(f"\nERROR: {error}\n")
+            for name, backend_dir, glob in missing:
+                log_file.write(f"  - {name}: expected {backend_dir}/{glob}\n")
+            return _result("failed", None, [], error)
+
+        if not selected_wheels:
+            log_file.write("\nNo wheels selected; nothing to install.\n")
+            return _result("ok", 0, [], "")
+
+        command = [
+            args.python,
+            "-m",
+            "pip",
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            *(str(path) for path in selected_wheels),
+        ]
+        log_file.write(f"\n$ {shell_join(command)}\n\n")
         log_file.flush()
+
+        if args.dry_run:
+            return _result("dry-run", 0, [command], "")
+
         try:
             completed = subprocess.run(
                 command,
@@ -678,28 +766,22 @@ def run_prepare_thirdparty(args: argparse.Namespace, output_dir: Path) -> RunRes
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 text=True,
-                timeout=args.prepare_timeout,
+                timeout=args.install_wheels_timeout,
                 check=False,
             )
-            exit_code = completed.returncode
-            if completed.returncode != 0:
-                status = "failed"
-                error = f"exit code {completed.returncode}"
-            elif args.dry_run:
-                status = "dry-run"
         except subprocess.TimeoutExpired:
-            status = "timeout"
-            error = f"timed out after {args.prepare_timeout}s"
-    return RunResult(
-        "thirdparty",
-        "prepare",
-        status,
-        exit_code,
-        [str(log_path)],
-        [shell_join(command)],
-        time.perf_counter() - started,
-        error,
-    )
+            error = f"pip install timed out after {args.install_wheels_timeout}s"
+            log_file.write(f"\nERROR: {error}\n")
+            return _result("timeout", None, [command], error)
+
+        if completed.returncode != 0:
+            return _result(
+                "failed",
+                completed.returncode,
+                [command],
+                f"pip install exited {completed.returncode}",
+            )
+        return _result("ok", completed.returncode, [command], "")
 
 
 def run_single(spec: RunSpec, logs_dir: Path, timeout_s: int) -> RunResult:
@@ -1284,15 +1366,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument(
-        "--skip-prepare-thirdparty",
-        action="store_true",
-        help="Do not clone/build/install third-party wheels before running benchmarks",
+        "--manifest",
+        default=None,
+        help=(
+            "Path to the third-party manifest. Defaults to "
+            "<thirdparty-dir>/manifest.json."
+        ),
     )
-    parser.add_argument("--prepare-timeout", type=int, default=3600)
-    parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--skip-thirdparty-clone", action="store_true")
-    parser.add_argument("--skip-thirdparty-build", action="store_true")
-    parser.add_argument("--skip-thirdparty-install", action="store_true")
+    parser.add_argument(
+        "--wheelhouse",
+        default=None,
+        help=(
+            "Directory containing per-backend wheel subfolders "
+            "(<wheelhouse>/<backend>/<wheel>). Defaults to "
+            "<thirdparty-dir>/wheelhouse, the same path used by "
+            "prepare_thirdparty.py."
+        ),
+    )
+    parser.add_argument(
+        "--skip-install-wheels",
+        action="store_true",
+        help=(
+            "Do not pip-install backend wheels from --wheelhouse before running "
+            "benchmarks. Use this when the wheels are already installed in the "
+            "active environment."
+        ),
+    )
+    parser.add_argument(
+        "--skip-prepare-thirdparty",
+        dest="skip_install_wheels",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--install-wheels-timeout",
+        type=int,
+        default=900,
+        help="Timeout (seconds) for the pip install step.",
+    )
     parser.add_argument(
         "--install-thirdparty-on-host",
         action="store_true",
@@ -1374,29 +1485,49 @@ def main(argv: Sequence[str] | None = None) -> int:
         and args.thirdparty_dir != str(default_thirdparty_dir())
     ):
         args.source_root = args.thirdparty_dir
+    thirdparty_dir = Path(args.thirdparty_dir).resolve()
+    if args.manifest is None:
+        args.manifest = str(thirdparty_dir / "manifest.json")
+    if args.wheelhouse is None:
+        args.wheelhouse = str(thirdparty_dir / "wheelhouse")
     output_dir = Path(args.output_dir).resolve() if args.output_dir else output_dir_for(Path("results"))
     output_dir.mkdir(parents=True, exist_ok=True)
     if args.runtime_wheelhouse is None:
-        args.runtime_wheelhouse = str((output_dir / "wheelhouse").resolve())
+        args.runtime_wheelhouse = args.wheelhouse
 
     run_results: list[RunResult] = []
     log_sources: list[tuple[str, Path]] = []
     should_run_benchmarks = not args.from_log or args.dry_run
+    use_slurm_container = (
+        args.launcher == "slurm"
+        and args.slurm_container_image
+        and not args.no_slurm_container
+    )
 
     if args.from_log:
         log_sources.extend(parse_from_log_args(args.from_log))
 
-    if should_run_benchmarks and not args.skip_prepare_thirdparty:
-        prepare_result = run_prepare_thirdparty(args, output_dir)
-        run_results.append(prepare_result)
-        log_sources.extend(collect_logs_from_results([prepare_result]))
-        if prepare_result.status not in {"ok", "dry-run"}:
+    if (
+        should_run_benchmarks
+        and not args.skip_install_wheels
+        and (not use_slurm_container or args.install_thirdparty_on_host)
+    ):
+        install_result = install_wheels_from_wheelhouse(args, output_dir)
+        run_results.append(install_result)
+        log_sources.extend(collect_logs_from_results([install_result]))
+        if install_result.status not in {"ok", "dry-run"}:
             paths = write_reports(metrics_from_logs(log_sources), run_results, output_dir)
             print_console_summary(metrics_from_logs(log_sources), paths)
-            print(f"\nThird-party preparation failed: {prepare_result.error}", file=sys.stderr)
+            print(f"\n{install_result.error}", file=sys.stderr)
+            print(
+                "Hint: build the missing wheels with "
+                "`python3 scripts/prepare_thirdparty.py` and rerun, or pass "
+                "`--skip-install-wheels` if the backends are already installed.",
+                file=sys.stderr,
+            )
             return 1
 
-    if should_run_benchmarks and not args.prepare_only:
+    if should_run_benchmarks:
         specs, skipped = make_run_specs(args, output_dir)
         run_results.extend(skipped)
         bench_results = run_specs(specs, output_dir, args.timeout, args.dry_run)

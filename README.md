@@ -27,15 +27,20 @@ Preview the commands without running GPU/RDMA workloads:
 python3 scripts/bench_p2p_compare.py --dry-run
 ```
 
-Prepare only: clone/update `3rdparty/`, build wheels, and install them into the
-active Python environment:
+Prepare third-party stacks: clone/update `3rdparty/`, build wheels into
+`3rdparty/wheelhouse/<backend>/`, and install them into the active Python
+environment. **You must run this once (or whenever versions change) before
+`bench_p2p_compare.py` is invoked**, because the bench script will only
+*install* pre-built wheels, never build them:
 
 ```bash
 python3 scripts/prepare_thirdparty.py
 ```
 
-Run all four default backends. This automatically runs
-`scripts/prepare_thirdparty.py` first:
+Run all four default backends. The bench script picks up the wheels from
+`3rdparty/wheelhouse/` and `pip install`s them into the current environment
+before running benchmarks; if any required wheel is missing it stops with an
+error pointing back at `prepare_thirdparty.py`:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -69,16 +74,17 @@ hostname as `MASTER_ADDR`; rank 0 acts as server/initiator and rank 1 acts as
 client/target where the backend needs explicit roles.
 
 In Slurm container mode, `scripts/prepare_thirdparty.py` builds wheels into
-`<output-dir>/wheelhouse` before `srun`. The Slurm task preamble runs:
+`3rdparty/wheelhouse/<backend>/` ahead of time. The Slurm task preamble runs:
 
 ```bash
-python3 -m pip install --force-reinstall --no-deps <output-dir>/wheelhouse/*/*.whl
+python3 -m pip install --force-reinstall --no-deps 3rdparty/wheelhouse/*/*.whl
 ```
 
 inside `docker.io/rocm/primus:v26.2` before launching the test. The script
 auto-adds Pyxis-style `--container-image`, `--container-workdir`, and
 `--container-mounts` options. Use `--slurm-container-mounts` for extra mounts,
-`--container-python` if the image uses a non-default Python, or
+`--container-python` if the image uses a non-default Python,
+`--runtime-wheelhouse` to point at a different wheel cache, or
 `--skip-runtime-wheel-install` to disable runtime wheel installation.
 
 Parse existing logs instead of launching benchmarks:
@@ -91,10 +97,13 @@ python3 scripts/bench_p2p_compare.py \
   --from-log nixl=/path/to/nixl.log
 ```
 
-By default the script uses `BenchP2P/3rdparty` as the source root. Use
-`--skip-prepare-thirdparty` to reuse an already prepared environment, or use
-`--source-root`, `--uccl-script`, `--nixl-script`, `--mooncake-script`, or
-`--mori-script` if the benchmark scripts live elsewhere.
+By default the script uses `BenchP2P/3rdparty` as the source root and reads
+wheels from `BenchP2P/3rdparty/wheelhouse/<backend>/`. Use
+`--skip-install-wheels` to reuse an already-installed environment, or
+`--wheelhouse <path>` / `--manifest <path>` to point at a different wheel
+cache. Use `--source-root`, `--uccl-script`, `--nixl-script`,
+`--mooncake-script`, or `--mori-script` if the benchmark scripts live
+elsewhere.
 
 ## Notes
 
