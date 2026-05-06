@@ -28,9 +28,12 @@ BenchP2P separates orchestration into three layers:
 - `scripts/slurm_run_p2p.sh`: Slurm layer. It performs a single `srun`
   allocation, starts the runtime container on each task, and forwards one
   command into the container.
-- `scripts/container_run_p2p.py`: container layer. Rank 0 builds third-party
-  wheels inside the runtime container, all ranks install those wheels from
-  `3rdparty/wheelhouse/*/*.whl`, then run MORI, Mooncake, UCCL, and NIXL
+- `scripts/container_prepare_thirdparty.py`: container preparation layer. Rank 0
+  builds third-party wheels inside the runtime container and all other ranks
+  wait on the per-job build marker.
+- `scripts/container_run_p2p.py`: container benchmark layer. It calls the
+  container preparation script when enabled, installs wheels from
+  `3rdparty/wheelhouse/*/*.whl`, then runs MORI, Mooncake, UCCL, and NIXL
   sequentially under the same Slurm allocation.
 
 ## Official Benchmark Mapping
@@ -71,11 +74,11 @@ Use this host-side command only for local development or to pre-populate
 python3 scripts/prepare_thirdparty.py
 ```
 
-Run all four default backends. In Slurm container mode, rank 0 runs
-`scripts/prepare_thirdparty.py` inside the container with `--skip-install`,
-writes wheels into `3rdparty/wheelhouse/<backend>/`, and the other ranks wait
-for the build marker before installing the wheels in their own container
-process:
+Run all four default backends. In Slurm container mode,
+`scripts/container_prepare_thirdparty.py` runs first inside the container. It
+uses `scripts/prepare_thirdparty.py --skip-install` on rank 0, writes wheels
+into `3rdparty/wheelhouse/<backend>/`, and the other ranks wait for the build
+marker before installing the wheels in their own container process:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -88,7 +91,8 @@ python3 scripts/bench_p2p_compare.py \
 The default launcher for real P2P is Slurm with two tasks across two nodes.
 The external CLI calls one Slurm script, and that script wraps each task with
 `docker run docker.io/rocm/primus:v26.2`. Inside the container,
-`container_run_p2p.py` builds, installs, and then runs every selected backend:
+`container_prepare_thirdparty.py` builds wheels and `container_run_p2p.py`
+installs them before running every selected backend:
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
@@ -119,9 +123,10 @@ bash scripts/slurm_run_p2p.sh \
   --slurm-gres gpu:1
 ```
 
-In Slurm container mode, `scripts/prepare_thirdparty.py` runs inside the
-runtime container before benchmark execution. Rank 0 serializes the build with
-a wheelhouse lock, writes a per-job completion marker, and all ranks then run:
+In Slurm container mode, `scripts/container_prepare_thirdparty.py` runs inside
+the runtime container before benchmark execution. It serializes rank 0's build
+with a wheelhouse lock, writes a per-job completion marker, and all ranks then
+run:
 
 ```bash
 python3 -m pip install --force-reinstall --no-deps 3rdparty/wheelhouse/*/*.whl

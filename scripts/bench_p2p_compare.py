@@ -182,6 +182,7 @@ def backend_script_paths(source_root: Path, args: argparse.Namespace) -> dict[st
 def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> list[str]:
     script = Path(args.slurm_script).resolve()
     runner = Path(args.container_runner).resolve()
+    prepare_runner = Path(args.container_prepare_runner).resolve()
     command = [
         "bash",
         str(script),
@@ -197,6 +198,8 @@ def make_slurm_script_command(args: argparse.Namespace, output_dir: Path) -> lis
         str(output_dir.resolve()),
         "--container-runner",
         str(runner),
+        "--container-prepare-runner",
+        str(prepare_runner),
         "--prepare-thirdparty-script",
         str(Path(args.prepare_thirdparty_script).resolve()),
         "--backends",
@@ -1586,6 +1589,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--container-runner",
         default=str(Path(__file__).resolve().with_name("container_run_p2p.py")),
+    )
+    parser.add_argument(
+        "--container-prepare-runner",
+        default=str(Path(__file__).resolve().with_name("container_prepare_thirdparty.py")),
     )
     parser.add_argument(
         "--prepare-thirdparty-script",

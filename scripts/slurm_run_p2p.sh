@@ -8,6 +8,7 @@ WHEELHOUSE=""
 MANIFEST=""
 OUTPUT_DIR="${REPO_ROOT}/results/slurm_run"
 CONTAINER_RUNNER="${SCRIPT_DIR}/container_run_p2p.py"
+CONTAINER_PREPARE_RUNNER="${SCRIPT_DIR}/container_prepare_thirdparty.py"
 PREPARE_THIRDPARTY_SCRIPT="${SCRIPT_DIR}/prepare_thirdparty.py"
 
 BACKENDS="mori,mooncake,uccl,nixl"
@@ -77,6 +78,7 @@ while [[ $# -gt 0 ]]; do
     --manifest) MANIFEST="$2"; shift 2 ;;
     --output-dir) OUTPUT_DIR="$2"; shift 2 ;;
     --container-runner) CONTAINER_RUNNER="$2"; shift 2 ;;
+    --container-prepare-runner) CONTAINER_PREPARE_RUNNER="$2"; shift 2 ;;
     --prepare-thirdparty-script) PREPARE_THIRDPARTY_SCRIPT="$2"; shift 2 ;;
     --backends) BACKENDS="$2"; shift 2 ;;
     --sizes) SIZES="$2"; shift 2 ;;
@@ -158,6 +160,7 @@ RUNNER=(
   --source-root "${SOURCE_ROOT}"
   --wheelhouse "${WHEELHOUSE}"
   --manifest "${MANIFEST}"
+  --container-prepare-runner "${CONTAINER_PREPARE_RUNNER}"
   --prepare-thirdparty-script "${PREPARE_THIRDPARTY_SCRIPT}"
   --prepare-thirdparty-timeout "${PREPARE_THIRDPARTY_TIMEOUT}"
   --mori-backend "${MORI_BACKEND}"
