@@ -131,6 +131,16 @@ def shell_join(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
+def shell_words(command: Sequence[str]) -> str:
+    return " ".join(shell_token(part) for part in command)
+
+
+def shell_token(value: str) -> str:
+    if value.startswith("$") or "${" in value:
+        return value
+    return shlex.quote(str(value))
+
+
 def default_source_root() -> Path:
     return Path(__file__).resolve().parents[1] / "3rdparty"
 
@@ -229,6 +239,8 @@ def make_run_specs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Run
             ]
             if args.async_api:
                 command.append("--async-api")
+            if args.launcher == "slurm":
+                command = make_uccl_slurm_command(args, script, sizes_csv)
             specs.append(
                 RunSpec(backend, backend, (tuple(command),), source_root, env.copy())
             )
@@ -251,6 +263,14 @@ def make_run_specs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Run
                 "--op-type",
                 args.op_type,
             ]
+            if args.launcher == "slurm":
+                command = make_nixl_family_slurm_command(
+                    args, script, sizes_csv, nixl_backend
+                )
+                specs.append(
+                    RunSpec(backend, backend, (tuple(command),), source_root, env.copy())
+                )
+                continue
             server = [
                 args.python,
                 *common,
@@ -281,6 +301,8 @@ def make_run_specs(args: argparse.Namespace, output_dir: Path) -> tuple[list[Run
         elif backend == "mori":
             for size in args.sizes:
                 command = make_mori_command(args, script, size)
+                if args.launcher == "slurm":
+                    command = make_mori_slurm_command(args, script, size)
                 specs.append(
                     RunSpec(
                         backend,
@@ -343,6 +365,173 @@ def make_mori_command(args: argparse.Namespace, script: Path, size: int) -> list
         "--num-target-dev",
         "1",
     ]
+
+
+def slurm_srun_prefix(args: argparse.Namespace) -> list[str]:
+    command = [
+        args.srun,
+        f"--nodes={args.slurm_nodes}",
+        f"--ntasks={args.slurm_ntasks}",
+        f"--ntasks-per-node={args.slurm_ntasks_per_node}",
+        "--kill-on-bad-exit=1",
+        "--export=ALL",
+    ]
+    optional = [
+        ("--partition", args.slurm_partition),
+        ("--account", args.slurm_account),
+        ("--qos", args.slurm_qos),
+        ("--time", args.slurm_time),
+        ("--constraint", args.slurm_constraint),
+        ("--gres", args.slurm_gres),
+        ("--gpus-per-task", args.slurm_gpus_per_task),
+        ("--cpus-per-task", args.slurm_cpus_per_task),
+        ("--job-name", args.slurm_job_name),
+    ]
+    for flag, value in optional:
+        if value:
+            command.append(f"{flag}={value}")
+    if args.slurm_extra_args:
+        command.extend(shlex.split(args.slurm_extra_args))
+    return command
+
+
+def slurm_preamble(args: argparse.Namespace) -> str:
+    return "\n".join(
+        [
+            "set -euo pipefail",
+            'SLURM_PROCID="${SLURM_PROCID:-0}"',
+            'SLURM_NTASKS="${SLURM_NTASKS:-1}"',
+            'SLURM_LOCALID="${SLURM_LOCALID:-0}"',
+            'MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | sed -n \'1p\')}"',
+            f'MASTER_PORT="${{MASTER_PORT:-{args.slurm_master_port}}}"',
+            'export MASTER_ADDR MASTER_PORT',
+            'export RANK="${SLURM_PROCID}"',
+            'export WORLD_SIZE="${SLURM_NTASKS}"',
+            'export LOCAL_RANK="${SLURM_LOCALID}"',
+            'export LOCAL_WORLD_SIZE="${SLURM_NTASKS_PER_NODE:-1}"',
+        ]
+    )
+
+
+def make_slurm_command(args: argparse.Namespace, body: str) -> list[str]:
+    return [*slurm_srun_prefix(args), "bash", "-lc", body]
+
+
+def make_uccl_slurm_command(
+    args: argparse.Namespace, script: Path, sizes_csv: str
+) -> list[str]:
+    command = [
+        args.python,
+        str(script),
+        "--sizes",
+        sizes_csv,
+        "--iters",
+        str(args.iters),
+        "--device",
+        args.device,
+        "--local-gpu-idx",
+        "${LOCAL_RANK}",
+        "--num-kvblocks",
+        str(args.num_blocks),
+    ]
+    if args.async_api:
+        command.append("--async-api")
+    body = f"{slurm_preamble(args)}\nexec {shell_words(command)}"
+    return make_slurm_command(args, body)
+
+
+def make_nixl_family_slurm_command(
+    args: argparse.Namespace, script: Path, sizes_csv: str, nixl_backend: str
+) -> list[str]:
+    common = [
+        str(script),
+        "--sizes",
+        sizes_csv,
+        "--iters",
+        str(args.iters),
+        "--device",
+        args.device,
+        "--local-gpu-idx",
+        "${LOCAL_RANK}",
+        "--num-kvblocks",
+        str(args.num_blocks),
+        "--backend",
+        nixl_backend,
+        "--op-type",
+        args.op_type,
+    ]
+    server = [
+        args.python,
+        *common,
+        "--role",
+        "server",
+        "--remote-ip",
+        args.server_bind_ip,
+    ]
+    client = [
+        args.python,
+        *common,
+        "--role",
+        "client",
+        "--remote-ip",
+        "${MASTER_ADDR}",
+    ]
+    body = "\n".join(
+        [
+            slurm_preamble(args),
+            'if [ "${SLURM_PROCID}" = "0" ]; then',
+            f"  exec {shell_words(server)}",
+            'elif [ "${SLURM_PROCID}" = "1" ]; then',
+            f"  exec {shell_words(client)}",
+            "else",
+            '  echo "BenchP2P: unused Slurm rank ${SLURM_PROCID}; expected ranks 0 and 1"',
+            "fi",
+        ]
+    )
+    return make_slurm_command(args, body)
+
+
+def make_mori_slurm_command(
+    args: argparse.Namespace, script: Path, size: int
+) -> list[str]:
+    common = [
+        args.python,
+        str(script),
+        "--backend",
+        args.mori_backend,
+        "--op-type",
+        args.op_type,
+        "--buffer-size",
+        str(size),
+        "--transfer-batch-size",
+        str(args.mori_transfer_batch_size),
+        "--iters",
+        str(args.iters),
+    ]
+    if args.mori_backend == "xgmi":
+        common.extend(
+            [
+                "--src-gpu",
+                str(args.local_gpu_idx),
+                "--dst-gpu",
+                str(args.dst_gpu_idx),
+            ]
+        )
+        if args.mori_xgmi_multiprocess:
+            common.append("--xgmi-multiprocess")
+    else:
+        common.extend(
+            [
+                "--host",
+                "${MASTER_ADDR}",
+                "--num-initiator-dev",
+                "1",
+                "--num-target-dev",
+                "1",
+            ]
+        )
+    body = f"{slurm_preamble(args)}\nexec {shell_words(common)}"
+    return make_slurm_command(args, body)
 
 
 def run_specs(
@@ -1014,6 +1203,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dst-gpu-idx", type=int, default=1)
     parser.add_argument("--op-type", choices=["write", "read"], default="write")
     parser.add_argument("--async-api", action="store_true", help="Use UCCL async path")
+    parser.add_argument(
+        "--launcher",
+        choices=["local", "slurm"],
+        default="slurm",
+        help="Use local processes or Slurm srun to launch P2P benchmarks",
+    )
     parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--torchrun", default="torchrun")
     parser.add_argument("--source-root", default=str(default_source_root()))
@@ -1041,6 +1236,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--server-ip", default="127.0.0.1", help="Client-visible server IP")
     parser.add_argument("--server-bind-ip", default="0.0.0.0", help="Server bind IP for pair runners")
     parser.add_argument("--pair-startup-seconds", type=float, default=2.0)
+    parser.add_argument("--srun", default="srun")
+    parser.add_argument("--slurm-nodes", type=int, default=2)
+    parser.add_argument("--slurm-ntasks", type=int, default=2)
+    parser.add_argument("--slurm-ntasks-per-node", type=int, default=1)
+    parser.add_argument("--slurm-master-port", type=int, default=29500)
+    parser.add_argument("--slurm-partition", default=None)
+    parser.add_argument("--slurm-account", default=None)
+    parser.add_argument("--slurm-qos", default=None)
+    parser.add_argument("--slurm-time", default=None)
+    parser.add_argument("--slurm-constraint", default=None)
+    parser.add_argument("--slurm-gres", default=None, help="Example: gpu:1")
+    parser.add_argument("--slurm-gpus-per-task", default=None)
+    parser.add_argument("--slurm-cpus-per-task", default=None)
+    parser.add_argument("--slurm-job-name", default="benchp2p")
+    parser.add_argument(
+        "--slurm-extra-args",
+        default="",
+        help="Extra arguments appended to srun, parsed with shlex",
+    )
     parser.add_argument("--mori-backend", choices=["rdma", "xgmi"], default="rdma")
     parser.add_argument("--mori-host", default="127.0.0.1")
     parser.add_argument(

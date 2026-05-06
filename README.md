@@ -39,10 +39,30 @@ Run all four default backends. This automatically runs
 
 ```bash
 python3 scripts/bench_p2p_compare.py \
+  --launcher slurm \
   --sizes 256,1K,4K,64K,1M,16M,100M \
   --iters 10 \
   --device gpu
 ```
+
+The default launcher for real P2P is Slurm with two tasks across two nodes:
+
+```bash
+python3 scripts/bench_p2p_compare.py \
+  --launcher slurm \
+  --slurm-nodes 2 \
+  --slurm-ntasks 2 \
+  --slurm-ntasks-per-node 1 \
+  --slurm-gres gpu:1 \
+  --sizes 256,1K,1M,16M \
+  --iters 10
+```
+
+Add scheduler-specific options with `--slurm-partition`, `--slurm-account`,
+`--slurm-qos`, `--slurm-time`, `--slurm-constraint`, or
+`--slurm-extra-args`. In Slurm mode the script uses the first allocated
+hostname as `MASTER_ADDR`; rank 0 acts as server/initiator and rank 1 acts as
+client/target where the backend needs explicit roles.
 
 Parse existing logs instead of launching benchmarks:
 
@@ -61,13 +81,16 @@ By default the script uses `BenchP2P/3rdparty` as the source root. Use
 
 ## Notes
 
-- UCCL is launched with `torchrun --standalone --nproc-per-node=2`.
-- NIXL and Mooncake are launched as local server/client pairs. Set
-  `--server-ip` if the client should connect to a non-loopback address.
+- Use `--launcher local` only for dry-run, log parsing, or single-node smoke
+  checks. Cross-node P2P performance should use `--launcher slurm`.
+- UCCL is launched as two Slurm tasks with PyTorch distributed environment
+  variables derived from `SLURM_PROCID` and `SLURM_NTASKS`.
+- NIXL and Mooncake are launched as one Slurm job where rank 0 runs the server
+  and rank 1 runs the client.
 - Mooncake is measured through the NIXL benchmark with `--backend mooncake`.
 - NIXL is measured through the UCCL repo's `benchmark_nixl.py` with
   `--backend ucx`.
-- MORI defaults to RDMA mode with a local two-rank `torchrun`. Use
+- MORI defaults to RDMA mode with two Slurm tasks. Use
   `--mori-backend xgmi` for single-node GPU-to-GPU XGMI testing.
 - MORI's published IO examples often use batched transfers. This harness
   defaults to `--mori-transfer-batch-size 1` for per-transfer comparison; set it
