@@ -106,6 +106,20 @@ DOCKER=(
   --env SLURM_LOCALID --env SLURM_NTASKS_PER_NODE
 )
 
+# Forward every UCCL_*/NCCL_* env from the host so backend tunables
+# (UCCL_P2P_RDMA_CC, UCCL_P2P_LOG_LEVEL, NCCL_DEBUG, ...) propagate
+# through `slurm_bench_p2p.sh -> container_bench_p2p.sh -> docker run`
+# without per-variable plumbing. Docker has no glob form; enumerate at
+# launch time. `compgen -e` lists exported var names; we only forward
+# those that are actually set (compgen output may include unset names
+# in some bash builds, so we re-check).
+while IFS= read -r _envname; do
+  [[ -z "${_envname}" ]] && continue
+  if [[ -n "${!_envname+x}" ]]; then
+    DOCKER+=(--env "${_envname}")
+  fi
+done < <(compgen -e | grep -E '^(UCCL_|NCCL_)' || true)
+
 # Pull paths out of inner args and bind-mount any that fall outside the repo.
 declare -A SEEN_MOUNTS=()
 add_mount() {

@@ -23,14 +23,9 @@ import json
 import math
 import os
 import re
-import select
 import shlex
-import shutil
-import socket
-import signal
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -89,10 +84,6 @@ def shell_join(command: Sequence[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
-def memory_type(device: str) -> str:
-    return "VRAM" if device == "gpu" else "DRAM"
-
-
 def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name)
     if raw is None or raw == "":
@@ -113,6 +104,10 @@ def rank_world_local() -> tuple[int, int, int]:
 # --------------------------------------------------------------------------- #
 # `run` subcommand
 # --------------------------------------------------------------------------- #
+#
+# The actual benchmark for each backend lives in scripts/backend/run_<backend>.sh.
+# This module's job is to: install the wheelhouse, normalise sizes, set up
+# distributed env vars, and then dispatch to the per-backend shell script.
 
 
 @dataclasses.dataclass
@@ -126,6 +121,9 @@ class RunArtifact:
     error: str = ""
 
 
+BACKEND_SCRIPT_DIR = Path(__file__).resolve().parent / "backend"
+
+
 def install_wheels(wheelhouse: Path) -> None:
     wheels = sorted(str(p) for p in wheelhouse.glob("*/*.whl"))
     if not wheels:
@@ -137,52 +135,6 @@ def install_wheels(wheelhouse: Path) -> None:
         [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps", *wheels],
         check=True,
     )
-
-
-def list_ib_devices() -> list[str]:
-    """Names of every IB/RoCE HCA visible via /sys/class/infiniband/."""
-    p = Path("/sys/class/infiniband")
-    if not p.exists():
-        return []
-    return sorted(d.name for d in p.iterdir() if d.is_dir())
-
-
-def hca_env_for_backend(backend: str, spec: str) -> dict[str, str]:
-    """Translate NCCL-style ``--ib-hca`` spec into per-backend env vars.
-
-    NCCL syntax: ``^a,b`` excludes a/b, otherwise the list is a whitelist.
-
-    - NCCL/RCCL ``NCCL_IB_HCA``: native `^` syntax, pass-through.
-    - MORI ``MORI_RDMA_DEVICES``: native `^` syntax, pass-through.
-    - UCCL ``UCCL_P2P_RDMA_DEV``: whitelist-only; for ``^a,b`` we expand to
-      every device under /sys/class/infiniband except {a, b}.
-    """
-    spec = (spec or "").strip()
-    if not spec:
-        return {}
-    out: dict[str, str] = {}
-    if backend in ("mori", "uccl"):
-        # Always set NCCL_IB_HCA too (RCCL plugins under torch.distributed
-        # in mori/uccl can pick it up).
-        out["NCCL_IB_HCA"] = spec
-    if backend == "mori":
-        out["MORI_RDMA_DEVICES"] = spec
-    elif backend == "uccl":
-        if spec.startswith("^"):
-            excluded = {x.strip() for x in spec[1:].split(",") if x.strip()}
-            available = list_ib_devices()
-            kept = [d for d in available if d not in excluded]
-            if kept:
-                out["UCCL_P2P_RDMA_DEV"] = ",".join(kept)
-            else:
-                print(
-                    f"[uccl] WARNING: --ib-hca={spec!r} excludes every HCA "
-                    f"({available}); leaving UCCL_P2P_RDMA_DEV unset",
-                    flush=True,
-                )
-        else:
-            out["UCCL_P2P_RDMA_DEV"] = spec
-    return out
 
 
 def install_runtime_pip_packages(packages_csv: str) -> None:
@@ -203,359 +155,110 @@ def install_runtime_pip_packages(packages_csv: str) -> None:
         )
 
 
-def open_log(log_path: Path) -> "tuple[Path, object]":
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    return log_path, log_path.open("w", encoding="utf-8")
+def normalize_sizes_for_backends(sizes_csv: str) -> str:
+    """Convert a comma-separated size list (1K/1M/integers) to integer bytes only.
+
+    The per-backend shell scripts expect integer bytes; doing the conversion
+    once here matches what each Python-side dispatcher used to do per-backend
+    (uccl normalised --sizes; mori parsed each --buffer-size; nixl/mooncake
+    assumed integer strings).
+    """
+    parts = [str(parse_size(s)) for s in sizes_csv.split(",") if s.strip()]
+    if not parts:
+        raise SystemExit("size list is empty")
+    return ",".join(parts)
 
 
-def stream_subprocess(
-    command: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    log_file,
-) -> int:
-    log_file.write(f"$ {shell_join(command)}\n\n")
-    log_file.flush()
-    proc = subprocess.Popen(
-        command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-    )
-    assert proc.stdout is not None
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        log_file.write(line)
-    proc.wait()
-    return proc.returncode
+def backend_script_path(backend: str) -> Path:
+    script = BACKEND_SCRIPT_DIR / f"run_{backend}.sh"
+    if not script.is_file():
+        raise SystemExit(f"backend script not found: {script}")
+    return script
 
 
-def terminate_process(proc: subprocess.Popen) -> None:
-    if proc.poll() is not None:
-        return
-    try:
-        proc.send_signal(signal.SIGTERM)
-        proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=10)
-
-
-def require_executable(name: str, candidates: Sequence[Path] = ()) -> str:
-    path = Path(name)
-    if path.is_absolute() or len(path.parts) > 1:
-        if path.exists():
-            return str(path)
-    found = shutil.which(name)
-    if found:
-        return found
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    searched = ", ".join(str(item) for item in candidates) or "PATH"
-    raise SystemExit(f"benchmark executable not found: {name} (searched {searched})")
-
-
-def backend_log_path(args: argparse.Namespace, backend: str, rank: int) -> Path:
-    return args.output_dir / "logs" / f"{backend}_rank{rank}.log"
-
-
-def backend_script_paths(args: argparse.Namespace) -> dict[str, Path]:
-    src = args.source_root
-    return {
-        "uccl": Path(args.uccl_script) if args.uccl_script
-                else src / "uccl" / "p2p" / "benchmarks" / "benchmark_uccl.py",
-        "mori": Path(args.mori_script) if args.mori_script
-                else src / "mori" / "tests" / "python" / "io" / "benchmark.py",
-        "mooncake": Path(args.mooncake_script) if args.mooncake_script else None,
-        "nixl": Path(args.nixl_script) if args.nixl_script else None,
-    }
-
-
-def run_uccl(args, env, src) -> int:
-    script = backend_script_paths(args)["uccl"]
-    if not script.exists():
-        raise SystemExit(f"benchmark script not found: {script}")
-    env = dict(env)
-    for k, v in hca_env_for_backend("uccl", args.ib_hca).items():
-        env[k] = v
-        print(f"[uccl] env: {k}={v}", flush=True)
-    # uccl benchmark_uccl.py demands "comma-separated integers" for --sizes;
-    # the rest of BenchP2P uses human-readable suffixes like "1K"/"1M" and
-    # the sweep mode (--size-min/--size-max) emits a list that may include
-    # them. Normalise to integer bytes here.
-    sizes_int = ",".join(str(parse_size(s)) for s in args.sizes.split(",") if s.strip())
-    command = [
-        sys.executable, str(script),
-        "--sizes", sizes_int,
-        "--iters", str(args.iters),
+def common_backend_args(args: argparse.Namespace, env: dict[str, str],
+                        sizes_int_csv: str) -> list[str]:
+    """Args shared by every scripts/backend/run_<backend>.sh."""
+    return [
+        "--rank", env["RANK"],
+        "--world-size", env["WORLD_SIZE"],
+        "--local-rank", env["LOCAL_RANK"],
+        "--master-addr", env["MASTER_ADDR"],
+        "--master-port", env["MASTER_PORT"],
+        "--output-dir", str(args.output_dir),
+        "--source-root", str(args.source_root),
         "--device", args.device,
-        "--local-gpu-idx", env["LOCAL_RANK"],
-        "--num-kvblocks", str(args.num_blocks),
+        "--sizes", sizes_int_csv,
+        "--iters", str(args.iters),
+        "--batch-size", str(args.batch_size),
+        "--op-type", args.op_type,
     ]
-    if args.async_api:
-        command.append("--async-api")
-    log_path, log_file = open_log(backend_log_path(args, "uccl", int(env["RANK"])))
-    try:
-        rc = stream_subprocess(command, src, env, log_file)
-    finally:
-        log_file.close()
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, command)
-    return rc
 
 
-def run_mori(args, env, src) -> None:
-    script = backend_script_paths(args)["mori"]
-    if not script.exists():
-        raise SystemExit(f"benchmark script not found: {script}")
-
-    # mori benchmark.py uses ``from tests.python.utils import ...``; root the
-    # process at the mori repo and put it on PYTHONPATH so that resolves.
-    mori_root = src / "mori"
-    if not (mori_root / "tests" / "python" / "utils.py").is_file():
-        try:
-            candidate = script.resolve().parents[3]
-            if (candidate / "tests" / "python" / "utils.py").is_file():
-                mori_root = candidate
-        except IndexError:
-            pass
-    mori_env = dict(env)
-    existing_pp = mori_env.get("PYTHONPATH", "")
-    mori_env["PYTHONPATH"] = (
-        f"{mori_root}{os.pathsep}{existing_pp}" if existing_pp else str(mori_root)
-    )
-    for k, v in hca_env_for_backend("mori", args.ib_hca).items():
-        mori_env[k] = v
-        print(f"[mori] env: {k}={v}", flush=True)
-
-    rank = int(env["RANK"])
-    # mori RDMA's --host is each engine's *local* TCP listen/bind address
-    # (see mori/src/application/transport/tcp/tcp.cpp::Listen). Peers exchange
-    # the resulting handle{host,port} through gloo (torch.distributed bound
-    # to MASTER_ADDR:MASTER_PORT) inside _initialize_rdma, so we do NOT need
-    # to pre-share the target's IP. Each rank just needs to bind to one of
-    # its own NIC IPv4s; rank 0 has MASTER_ADDR by definition (slurm head
-    # node), other ranks resolve their own hostname.
-    if args.mori_backend == "rdma":
-        if rank == 0:
-            mori_host = mori_env["MASTER_ADDR"]
-        else:
-            try:
-                mori_host = socket.gethostbyname(socket.gethostname())
-            except OSError:
-                mori_host = mori_env["MASTER_ADDR"]
-        print(f"[mori] rank={rank} binding --host={mori_host}", flush=True)
-    else:
-        mori_host = mori_env["MASTER_ADDR"]
-
-    log_path, log_file = open_log(backend_log_path(args, "mori", rank))
-    try:
-        for size in args.sizes.split(","):
-            # mori benchmark.py wants integer bytes for --buffer-size; the
-            # rest of BenchP2P uses human-readable suffixes like "1K"/"1M".
-            size_bytes = parse_size(size.strip())
-            command = [
-                sys.executable, str(script),
-                "--backend", args.mori_backend,
-                "--op-type", args.op_type,
-                "--buffer-size", str(size_bytes),
-                "--transfer-batch-size", str(args.mori_transfer_batch_size),
-                "--iters", str(args.iters),
-            ]
-            if args.mori_backend == "xgmi":
-                command.extend(["--src-gpu", "0", "--dst-gpu", "1"])
-                if args.mori_xgmi_multiprocess:
-                    command.append("--xgmi-multiprocess")
-            else:
-                command.extend([
-                    "--host", mori_host,
-                    "--num-initiator-dev", "1",
-                    "--num-target-dev", "1",
-                ])
-            rc = stream_subprocess(command, mori_root, mori_env, log_file)
-            if rc != 0:
-                raise subprocess.CalledProcessError(rc, command)
-    finally:
-        log_file.close()
+def backend_extra_args(args: argparse.Namespace, backend: str) -> list[str]:
+    """Backend-specific argv added on top of common_backend_args."""
+    if backend == "uccl":
+        out: list[str] = []
+        if args.ib_hca:
+            out += ["--ib-hca", args.ib_hca]
+        if args.uccl_script:
+            out += ["--script", args.uccl_script]
+        if args.async_api:
+            out.append("--async-api")
+        if args.uccl_sendrecv:
+            out.append("--uccl-sendrecv")
+        if args.uccl_no_lazy:
+            out.append("--no-lazy")
+        return out
+    if backend == "mori":
+        out = ["--mori-backend", args.mori_backend]
+        if args.ib_hca:
+            out += ["--ib-hca", args.ib_hca]
+        if args.mori_script:
+            out += ["--script", args.mori_script]
+        if args.mori_xgmi_multiprocess:
+            out.append("--mori-xgmi-multiprocess")
+        return out
+    if backend == "nixl":
+        out = [
+            "--nixlbench-bin", args.nixlbench_bin,
+            "--nixl-backend", args.nixl_backend,
+            "--nixl-seg-type", args.nixl_seg_type,
+            "--pair-startup-seconds", str(args.pair_startup_seconds),
+            "--nixl-start-etcd", "1" if args.nixl_start_etcd else "0",
+        ]
+        if args.nixl_etcd_endpoints:
+            out += ["--nixl-etcd-endpoints", args.nixl_etcd_endpoints]
+        if args.nixl_device_list:
+            out += ["--nixl-device-list", args.nixl_device_list]
+        return out
+    if backend == "mooncake":
+        out = [
+            "--mooncake-bench-bin", args.mooncake_bench_bin,
+            "--mooncake-xport-type", args.mooncake_xport_type or "rdma",
+            "--mooncake-threads", str(args.mooncake_threads),
+            "--mooncake-duration", str(args.mooncake_duration),
+            "--mooncake-target-wait-seconds", str(args.mooncake_target_wait_seconds),
+            "--pair-startup-seconds", str(args.pair_startup_seconds),
+        ]
+        if args.ib_hca:
+            out += ["--ib-hca", args.ib_hca]
+        return out
+    raise RuntimeError(f"unknown backend: {backend}")
 
 
-def start_etcd_if_needed(args, env) -> subprocess.Popen | None:
-    if not args.nixl_start_etcd or int(env["RANK"]) != 0:
-        return None
-    etcd = shutil.which("etcd")
-    if etcd is None:
-        raise SystemExit(
-            "nixlbench requires ETCD coordination. Install 'etcd' in the runtime "
-            "container or pass --no-nixl-start-etcd with --nixl-etcd-endpoints."
-        )
-    master = env["MASTER_ADDR"]
-    data_dir = f"/tmp/benchp2p-etcd-{os.getpid()}"
+def invoke_backend_script(args: argparse.Namespace, env: dict[str, str],
+                          backend: str, sizes_int_csv: str) -> None:
+    script = backend_script_path(backend)
     command = [
-        etcd, "--data-dir", data_dir,
-        "--listen-client-urls", "http://0.0.0.0:2379",
-        "--advertise-client-urls", f"http://{master}:2379",
-        "--listen-peer-urls", "http://0.0.0.0:2380",
-        "--initial-advertise-peer-urls", f"http://{master}:2380",
-        "--initial-cluster", f"default=http://{master}:2380",
-        "--log-level", "error",
+        "bash", str(script),
+        *common_backend_args(args, env, sizes_int_csv),
+        *backend_extra_args(args, backend),
     ]
     print("+ " + shell_join(command), flush=True)
-    proc = subprocess.Popen(command)
-    time.sleep(2.0)
-    return proc
-
-
-def run_nixlbench(args, env, src) -> None:
-    rank = int(env["RANK"])
-    if rank > 1:
-        print(f"[nixl] skipping unused rank {rank}", flush=True)
-        return
-    if rank == 1 and args.pair_startup_seconds > 0:
-        time.sleep(args.pair_startup_seconds)
-    binary = require_executable(
-        args.nixlbench_bin,
-        [
-            src / "nixl" / "benchmark" / "nixlbench" / "build" / "nixlbench",
-            src / "nixl" / "benchmark" / "nixlbench" / "build" / "src" / "nixlbench",
-        ],
-    )
-    endpoints = args.nixl_etcd_endpoints or f"http://{env['MASTER_ADDR']}:2379"
-    seg_type = memory_type(args.device)
-    log_path, log_file = open_log(backend_log_path(args, "nixl", rank))
-    etcd_proc = start_etcd_if_needed(args, env)
-    try:
-        for size in [s.strip() for s in args.sizes.split(",") if s.strip()]:
-            command = [
-                binary,
-                "--etcd_endpoints", endpoints,
-                "--backend", args.nixl_backend,
-                "--initiator_seg_type", seg_type,
-                "--target_seg_type", seg_type,
-                "--scheme", "pairwise",
-                "--op_type", args.op_type.upper(),
-                "--total_buffer_size", str(max(int(size) * args.num_blocks * 4, 1 << 30)),
-                "--start_block_size", size,
-                "--max_block_size", size,
-                "--start_batch_size", str(args.num_blocks),
-                "--max_batch_size", str(args.num_blocks),
-                "--num_iter", str(args.iters),
-                "--warmup_iter", str(max(1, min(100, args.iters))),
-                "--num_threads", "1",
-                "--num_initiator_dev", "1",
-                "--num_target_dev", "1",
-            ]
-            if args.nixl_device_list:
-                command.extend(["--device_list", args.nixl_device_list])
-            rc = stream_subprocess(command, src, env, log_file)
-            if rc != 0:
-                raise subprocess.CalledProcessError(rc, command)
-    finally:
-        log_file.close()
-        if etcd_proc is not None:
-            terminate_process(etcd_proc)
-
-
-def mooncake_segment_file(src: Path, env: dict[str, str], size: str) -> Path:
-    job = env.get("SLURM_JOB_ID", str(os.getppid()))
-    runtime_dir = src / ".benchp2p_runtime"
-    runtime_dir.mkdir(parents=True, exist_ok=True)
-    return runtime_dir / f"mooncake_target_seg_{job}_{size}.txt"
-
-
-def mooncake_base_command(binary: str, args, env, size) -> list[str]:
-    seg_type = memory_type(args.device)
-    command = [
-        binary,
-        "--seg_type", seg_type,
-        "--backend", args.mooncake_backend,
-        "--op_type", args.op_type,
-        "--total_buffer_size", str(max(int(size) * args.num_blocks * 4, 1 << 30)),
-        "--start_block_size", size,
-        "--max_block_size", size,
-        "--start_batch_size", str(args.num_blocks),
-        "--max_batch_size", str(args.num_blocks),
-        "--start_num_threads", "1",
-        "--max_num_threads", "1",
-        "--duration", str(args.mooncake_duration),
-        "--local_gpu_id", env["LOCAL_RANK"],
-        "--target_gpu_id", "0",
-    ]
-    if args.mooncake_backend == "tent":
-        command.extend(["--metadata_type", "p2p"])
-        if args.mooncake_xport_type:
-            command.extend(["--xport_type", args.mooncake_xport_type])
-    return command
-
-
-def run_mooncake_tebench(args, env, src) -> None:
-    rank = int(env["RANK"])
-    if rank > 1:
-        print(f"[mooncake] skipping unused rank {rank}", flush=True)
-        return
-    binary = require_executable(
-        args.mooncake_bench_bin,
-        [
-            src / "Mooncake" / "build" / "mooncake-transfer-engine" / "benchmark" / "tebench",
-            src / "Mooncake" / "build" / "tebench",
-        ],
-    )
-    log_path, log_file = open_log(backend_log_path(args, "mooncake", rank))
-    try:
-        for size in [s.strip() for s in args.sizes.split(",") if s.strip()]:
-            segment_file = mooncake_segment_file(src, env, size)
-            command = mooncake_base_command(binary, args, env, size)
-            if rank == 0:
-                try:
-                    segment_file.unlink()
-                except FileNotFoundError:
-                    pass
-                log_file.write(f"$ {shell_join(command)}\n\n"); log_file.flush()
-                print("+ " + shell_join(command), flush=True)
-                target = subprocess.Popen(
-                    command, cwd=src, env=env,
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                )
-                deadline = time.monotonic() + args.pair_startup_seconds + 20
-                target_seg_name: str | None = None
-                assert target.stdout is not None
-                while time.monotonic() < deadline and target.poll() is None:
-                    ready, _, _ = select.select([target.stdout], [], [], 0.5)
-                    if not ready:
-                        continue
-                    line = target.stdout.readline()
-                    if not line:
-                        continue
-                    sys.stdout.write(line); log_file.write(line)
-                    match = re.search(r"--target_seg_name=([^\s]+)", line)
-                    if match:
-                        target_seg_name = match.group(1)
-                        segment_file.write_text(target_seg_name + "\n", encoding="utf-8")
-                        break
-                if target_seg_name is None:
-                    terminate_process(target)
-                    raise SystemExit("Mooncake tebench target did not print --target_seg_name")
-                # Continue draining target stdout while client runs.
-                drain_deadline = time.monotonic() + args.pair_startup_seconds + args.mooncake_duration + 10
-                while time.monotonic() < drain_deadline and target.poll() is None:
-                    ready, _, _ = select.select([target.stdout], [], [], 0.5)
-                    if not ready:
-                        continue
-                    chunk = target.stdout.readline()
-                    if not chunk:
-                        break
-                    sys.stdout.write(chunk); log_file.write(chunk)
-                terminate_process(target)
-            else:
-                deadline = time.monotonic() + args.pair_startup_seconds + 20
-                while not segment_file.exists() and time.monotonic() < deadline:
-                    time.sleep(0.5)
-                if not segment_file.exists():
-                    raise SystemExit(f"Mooncake target segment file not found: {segment_file}")
-                target_seg_name = segment_file.read_text(encoding="utf-8").strip()
-                command.extend(["--target_seg_name", target_seg_name])
-                rc = stream_subprocess(command, src, env, log_file)
-                if rc != 0:
-                    raise subprocess.CalledProcessError(rc, command)
-    finally:
-        log_file.close()
+    completed = subprocess.run(command, env=env)
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(completed.returncode, command)
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -614,21 +317,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     backends = [b.strip().lower() for b in args.backends.split(",") if b.strip()]
     succeeded: list[str] = []
     failed: list[tuple[str, str]] = []
-    src = args.source_root
+    sizes_int_csv = normalize_sizes_for_backends(args.sizes)
 
     for backend in backends:
         print(f"\n==> [{backend}] starting (rank {rank}/{world})", flush=True)
         try:
-            if backend == "uccl":
-                run_uccl(args, env, src)
-            elif backend == "mori":
-                run_mori(args, env, src)
-            elif backend == "nixl":
-                run_nixlbench(args, env, src)
-            elif backend == "mooncake":
-                run_mooncake_tebench(args, env, src)
-            else:
-                raise RuntimeError(f"unknown backend: {backend}")
+            invoke_backend_script(args, env, backend, sizes_int_csv)
         except (subprocess.CalledProcessError, RuntimeError, OSError, SystemExit) as exc:
             reason = (
                 f"exit {exc.returncode}" if isinstance(exc, subprocess.CalledProcessError)
@@ -668,27 +362,140 @@ class Metric:
     raw_line: str = ""
 
 
+def message_bytes(m: Metric) -> int:
+    """Wire-level "message" size per iter = per-block size * batch_size.
+
+    BenchP2P normalizes every backend's reported size to a per-BLOCK figure
+    (mori `transfer_batch_size`, nixl `--start_batch_size`, mooncake
+    `--block_size`, and uccl after run_uccl.sh divides by num-kvblocks).
+    The actual amount of bytes the NIC moves per iteration is
+    block_size * batch_size, which matters for fairness when comparing
+    runs that swept batch_size. Computed lazily because Metric is frozen.
+    """
+    return m.size_bytes * max(m.batch_size, 1)
+
+
+_MOONCAKE_TE_BLOCKSIZE_RE = re.compile(r"--block_size[ =](\d+)")
+_MOONCAKE_TE_BATCHSIZE_RE = re.compile(r"--batch_size[ =](\d+)")
+_MOONCAKE_TE_RESULT_RE = re.compile(
+    r"Test completed:\s*duration\s+([\d.]+),\s*batch count\s+(\d+),\s*"
+    r"throughput\s+([\d.]+)\s*([KMGT]i?[Bb])/s"
+)
+# Marker emitted by scripts/backend/run_uccl.sh; carries the unified
+# batch_size that run_uccl.sh used to scale UCCL's --sizes (per-MESSAGE
+# total) up from BenchP2P's --sizes (per-BLOCK). The parser divides
+# UCCL's reported size by this batch_size to recover the per-block
+# size_bytes used by mori / nixl / mooncake.
+_UCCL_BATCH_MARKER_RE = re.compile(r"\[bench_p2p_compare\]\s+uccl\s+batch_size=(\d+)")
+# Same marker line also stamps the op_type (write/read/sendrecv) so
+# Metric.operation reflects the real ULP UCCL ran. write/read come from
+# benchmark_uccl_readwrite.py; sendrecv from the legacy benchmark_uccl.py
+# under --uccl-sendrecv. Older logs without this token fall back to the
+# Metric.operation default ("write").
+_UCCL_OPTYPE_MARKER_RE = re.compile(r"\[bench_p2p_compare\]\s+uccl\b[^\n]*\bop_type=(\w+)")
+
+
 def parse_metrics(backend: str, text: str, source: str) -> list[Metric]:
     metrics: list[Metric] = []
+    # State for mooncake's transfer_engine_bench, whose output is one
+    # `Test completed: duration X, batch count Y, throughput Z UNIT/s`
+    # line per run; block/batch size comes from the argv we logged
+    # earlier in the same file.
+    mooncake_block: int | None = None
+    mooncake_batch: int = 1
+    # State for UCCL: run_uccl.sh logs `[bench_p2p_compare] uccl
+    # batch_size=N op_type=... ...` once at the top so we can divide
+    # UCCL's reported per-message size by N to get the per-block size that
+    # matches the other three backends, and stamp Metric.operation with
+    # the actual RDMA op (write/read/sendrecv).
+    uccl_batch: int = 1
+    uccl_op: str | None = None
     for line in text.splitlines():
+        if backend == "uccl":
+            mb = _UCCL_BATCH_MARKER_RE.search(line)
+            if mb is not None:
+                try:
+                    uccl_batch = max(int(mb.group(1)), 1)
+                except ValueError:
+                    pass
+            mo = _UCCL_OPTYPE_MARKER_RE.search(line)
+            if mo is not None:
+                uccl_op = mo.group(1).lower()
         match = LOG_LINE_RE.search(line)
         if match:
-            metrics.append(Metric(
+            raw_size = parse_size(match.group("size"))
+            if backend == "uccl" and uccl_batch > 1:
+                size_bytes = raw_size // uccl_batch
+                metric_batch = uccl_batch
+            else:
+                size_bytes = raw_size
+                metric_batch = 1
+            kwargs: dict[str, object] = dict(
                 backend=backend,
-                size_bytes=parse_size(match.group("size")),
+                size_bytes=size_bytes,
                 gbps=float(match.group("gbps")),
                 gb_s=float(match.group("gb_s")),
                 latency_us=float(match.group("lat_s")) * 1_000_000,
                 role=match.group("role"),
+                batch_size=metric_batch,
                 source=source,
                 raw_line=line.strip(),
-            ))
+            )
+            if backend == "uccl" and uccl_op is not None:
+                kwargs["operation"] = uccl_op
+            metrics.append(Metric(**kwargs))
             continue
         if backend == "mori":
             m = parse_mori_table_line(backend, line, source)
             if m is not None:
                 metrics.append(m)
-        elif backend in {"mooncake", "nixl"}:
+        elif backend == "mooncake":
+            mb = _MOONCAKE_TE_BLOCKSIZE_RE.search(line)
+            if mb is not None:
+                mooncake_block = int(mb.group(1))
+            mc = _MOONCAKE_TE_BATCHSIZE_RE.search(line)
+            if mc is not None:
+                mooncake_batch = int(mc.group(1))
+            m_te = _MOONCAKE_TE_RESULT_RE.search(line)
+            if m_te is not None and mooncake_block is not None:
+                duration_s = float(m_te.group(1))
+                throughput_val = float(m_te.group(3))
+                unit = m_te.group(4)
+                # Convert reported throughput to GB/s. mooncake's
+                # calculateRate() supports GB/GiB/Gb/MB/MiB/Mb/KB/KiB/Kb;
+                # we map them to byte-based GB/s for consistency with
+                # mori/uccl/nixl.
+                unit_to_bytes = {
+                    "Gb": 1_000_000_000 / 8,  "GB": 1_000_000_000,  "GiB": 1 << 30,
+                    "Mb": 1_000_000 / 8,      "MB": 1_000_000,      "MiB": 1 << 20,
+                    "Kb": 1_000 / 8,          "KB": 1_000,          "KiB": 1 << 10,
+                }
+                bytes_per_sec = throughput_val * unit_to_bytes.get(unit, 1)
+                gb_s = bytes_per_sec / 1_000_000_000
+                # Per-batch latency = duration_s / batch_count (us).
+                try:
+                    avg_us = duration_s / int(m_te.group(2)) * 1_000_000
+                except ZeroDivisionError:
+                    avg_us = 0.0
+                metrics.append(Metric(
+                    backend=backend,
+                    size_bytes=mooncake_block,
+                    gbps=gb_s * 8,
+                    gb_s=gb_s,
+                    latency_us=avg_us,
+                    role="initiator",
+                    batch_size=mooncake_batch,
+                    source=source,
+                    raw_line=line.strip(),
+                ))
+                continue
+            # Fall back to the generic 4-column-table parser so the
+            # legacy `tebench` output (still possible if user forces
+            # --mooncake-bench-bin tebench) keeps working.
+            m = parse_official_table_line(backend, line, source)
+            if m is not None:
+                metrics.append(m)
+        elif backend == "nixl":
             m = parse_official_table_line(backend, line, source)
             if m is not None:
                 metrics.append(m)
@@ -730,13 +537,16 @@ def parse_official_table_line(backend: str, line: str, source: str) -> Metric | 
 
 
 def select_metrics(metrics: Sequence[Metric]) -> list[Metric]:
-    grouped: dict[tuple[str, int, str], list[Metric]] = {}
+    # Dedup key includes batch_size so a single run that sweeps both
+    # block-size AND batch-size (e.g. 1MB at bs=1 vs bs=128) keeps both
+    # points instead of folding them onto one row.
+    grouped: dict[tuple[str, int, int, str], list[Metric]] = {}
     for m in metrics:
-        grouped.setdefault((m.backend, m.size_bytes, m.operation), []).append(m)
+        grouped.setdefault((m.backend, m.size_bytes, m.batch_size, m.operation), []).append(m)
     selected = []
     for group in grouped.values():
         selected.append(sorted(group, key=metric_preference)[0])
-    return sorted(selected, key=lambda m: (m.backend, m.size_bytes))
+    return sorted(selected, key=lambda m: (m.backend, m.size_bytes, m.batch_size))
 
 
 def metric_preference(metric: Metric) -> tuple[int, str]:
@@ -780,13 +590,17 @@ def write_csv(metrics: Sequence[Metric], path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=[
             "backend", "size_bytes", "size", "batch_size",
+            "message_bytes", "message_size",
             "gbps", "gb_per_s", "latency_us", "role", "source",
         ])
         writer.writeheader()
         for m in metrics:
+            mb = message_bytes(m)
             writer.writerow({
                 "backend": m.backend, "size_bytes": m.size_bytes, "size": human_size(m.size_bytes),
-                "batch_size": m.batch_size, "gbps": f"{m.gbps:.6f}", "gb_per_s": f"{m.gb_s:.6f}",
+                "batch_size": m.batch_size,
+                "message_bytes": mb, "message_size": human_size(mb),
+                "gbps": f"{m.gbps:.6f}", "gb_per_s": f"{m.gb_s:.6f}",
                 "latency_us": f"{m.latency_us:.6f}", "role": m.role, "source": m.source,
             })
 
@@ -801,8 +615,15 @@ def summarize_backends(metrics: Sequence[Metric]) -> list[dict[str, object]]:
         best_bw = max(values, key=lambda x: x.gb_s)
         best_lat = min(values, key=lambda x: x.latency_us)
         rows.append({
-            "backend": backend, "bw": best_bw.gb_s, "bw_size": human_size(best_bw.size_bytes),
-            "lat": best_lat.latency_us, "lat_size": human_size(best_lat.size_bytes),
+            "backend": backend,
+            "bw": best_bw.gb_s,
+            "bw_size": human_size(best_bw.size_bytes),
+            "bw_batch": best_bw.batch_size,
+            "bw_message": human_size(message_bytes(best_bw)),
+            "lat": best_lat.latency_us,
+            "lat_size": human_size(best_lat.size_bytes),
+            "lat_batch": best_lat.batch_size,
+            "lat_message": human_size(message_bytes(best_lat)),
             "points": len(values),
         })
     return rows
@@ -813,7 +634,10 @@ def write_summary_csv(metrics: Sequence[Metric], path: Path) -> None:
     with path.open("w", encoding="utf-8", newline="") as fh:
         writer = csv.DictWriter(fh, fieldnames=[
             "backend", "best_bandwidth_gb_s", "best_bandwidth_size",
-            "best_latency_us", "best_latency_size", "points",
+            "best_bandwidth_batch", "best_bandwidth_message_size",
+            "best_latency_us", "best_latency_size",
+            "best_latency_batch", "best_latency_message_size",
+            "points",
         ])
         writer.writeheader()
         for row in rows:
@@ -821,8 +645,12 @@ def write_summary_csv(metrics: Sequence[Metric], path: Path) -> None:
                 "backend": row["backend"],
                 "best_bandwidth_gb_s": f"{row['bw']:.6f}",
                 "best_bandwidth_size": row["bw_size"],
+                "best_bandwidth_batch": row["bw_batch"],
+                "best_bandwidth_message_size": row["bw_message"],
                 "best_latency_us": f"{row['lat']:.6f}",
                 "best_latency_size": row["lat_size"],
+                "best_latency_batch": row["lat_batch"],
+                "best_latency_message_size": row["lat_message"],
                 "points": row["points"],
             })
 
@@ -833,23 +661,28 @@ def write_markdown(metrics: Sequence[Metric], path: Path) -> None:
         "",
         "## Per-size results",
         "",
-        "| Backend | Size | Batch | Bandwidth (GB/s) | Bandwidth (Gbps) | Latency (us) | Role |",
-        "|---|---:|---:|---:|---:|---:|---|",
+        "_Message = block size x batch (bytes actually moved per iter)._",
+        "",
+        "| Backend | Block | Batch | Message | Bandwidth (GB/s) | Bandwidth (Gbps) | Latency (us) | Role |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for m in metrics:
         lines.append(
             f"| {m.backend} | {human_size(m.size_bytes)} | {m.batch_size} | "
+            f"{human_size(message_bytes(m))} | "
             f"{m.gb_s:.3f} | {m.gbps:.3f} | {m.latency_us:.3f} | {m.role or '-'} |"
         )
     lines.extend([
         "", "## Backend summary", "",
-        "| Backend | Best bandwidth | Bandwidth size | Best latency | Latency size | Points |",
-        "|---|---:|---:|---:|---:|---:|",
+        "| Backend | Best bandwidth | BW block | BW message | Best latency | Lat block | Lat message | Points |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ])
     for row in summarize_backends(metrics):
         lines.append(
             f"| {row['backend']} | {row['bw']:.3f} GB/s | {row['bw_size']} | "
-            f"{row['lat']:.3f} us | {row['lat_size']} | {row['points']} |"
+            f"{row['bw_message']} | "
+            f"{row['lat']:.3f} us | {row['lat_size']} | {row['lat_message']} | "
+            f"{row['points']} |"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -901,7 +734,12 @@ def write_png(metrics: Sequence[Metric], path: Path) -> None:
         plt.close(fig)
         return
 
-    sizes = sorted({m.size_bytes for m in metrics})
+    # x-axis = message size (block * batch), i.e. how many bytes the NIC
+    # actually moves per iter. With batch sweeps in the same plot, two
+    # points at the same per-block size but different batch sizes will
+    # land at distinct x positions instead of stacking on top of each
+    # other (which they would if we keyed on size_bytes alone).
+    sizes = sorted({message_bytes(m) for m in metrics})
     backends = sorted({m.backend for m in metrics})
     colors = {"mori": "#1f77b4", "mooncake": "#ff7f0e", "uccl": "#2ca02c", "nixl": "#d62728"}
 
@@ -919,15 +757,28 @@ def write_png(metrics: Sequence[Metric], path: Path) -> None:
         2, 1, figsize=(11.2, 7.6), dpi=150, sharex=True,
         gridspec_kw={"hspace": 0.35},
     )
-    fig.suptitle("P2P bandwidth and latency comparison", fontsize=16, fontweight="bold", x=0.08, ha="left")
+    # Surface batch_size in the title so a single PNG snapshot is
+    # self-describing: a "block=4KB" point at batch=128 moves 512KB on
+    # the wire, which matters when comparing it against a batch=1 run.
+    batches = sorted({m.batch_size for m in metrics})
+    if len(batches) == 1:
+        batch_suffix = f"  (batch={batches[0]})"
+    elif len(batches) <= 4:
+        batch_suffix = f"  (batch={','.join(str(b) for b in batches)})"
+    else:
+        batch_suffix = f"  (batch={batches[0]}..{batches[-1]})"
+    fig.suptitle(
+        f"P2P bandwidth and latency comparison{batch_suffix}",
+        fontsize=16, fontweight="bold", x=0.08, ha="left",
+    )
 
     x_idx = list(range(len(sizes)))
     size_to_x = {size: i for i, size in enumerate(sizes)}
 
     for backend in backends:
-        values = sorted([m for m in metrics if m.backend == backend], key=lambda m: m.size_bytes)
+        values = sorted([m for m in metrics if m.backend == backend], key=message_bytes)
         color = colors.get(backend, color_for_name(backend))
-        xs = [size_to_x[m.size_bytes] for m in values]
+        xs = [size_to_x[message_bytes(m)] for m in values]
         ax_bw.plot(xs, [m.gb_s for m in values], marker="o", linewidth=2.0,
                    color=color, label=backend, markeredgecolor="white", markersize=6)
         ax_lat.plot(xs, [m.latency_us for m in values], marker="o", linewidth=2.0,
@@ -949,7 +800,15 @@ def write_png(metrics: Sequence[Metric], path: Path) -> None:
 
     ax_lat.set_xticks(x_idx)
     ax_lat.set_xticklabels([human_size(s) for s in sizes], rotation=35, ha="right")
-    ax_lat.set_xlabel("Message size")
+    # Inline the actual batch_size into the xlabel so the per-iter wire
+    # bytes are obvious from the chart alone (e.g. `block x 128`).
+    if len(batches) == 1:
+        batch_label = str(batches[0])
+    elif len(batches) <= 4:
+        batch_label = "{" + ",".join(str(b) for b in batches) + "}"
+    else:
+        batch_label = f"{batches[0]}..{batches[-1]}"
+    ax_lat.set_xlabel(f"Message size  (block x {batch_label})")
     if len(x_idx) > 1:
         ax_lat.set_xlim(-0.4, len(x_idx) - 0.6)
 
@@ -993,12 +852,19 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not selected:
         print("No benchmark metrics were parsed.")
     else:
-        print("\nBackend summary:")
-        print(f"{'Backend':<12} {'Best GB/s':>12} {'BW size':>12} {'Best us':>12} {'Lat size':>12}")
+        print("\nBackend summary (Message = block x batch):")
+        print(
+            f"{'Backend':<12} {'Best GB/s':>12} "
+            f"{'BW block':>10} {'BW batch':>9} {'BW msg':>10} "
+            f"{'Best us':>12} "
+            f"{'Lat block':>10} {'Lat batch':>10} {'Lat msg':>10}"
+        )
         for row in summarize_backends(selected):
             print(
-                f"{row['backend']:<12} {row['bw']:>12.3f} {row['bw_size']:>12} "
-                f"{row['lat']:>12.3f} {row['lat_size']:>12}"
+                f"{row['backend']:<12} {row['bw']:>12.3f} "
+                f"{row['bw_size']:>10} {row['bw_batch']:>9} {row['bw_message']:>10} "
+                f"{row['lat']:>12.3f} "
+                f"{row['lat_size']:>10} {row['lat_batch']:>10} {row['lat_message']:>10}"
             )
     print("\nReports:")
     for name, path in paths.items():
@@ -1042,7 +908,22 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help="Multiplier between consecutive sweep sizes (default 2 = doubling).",
     )
     parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument("--num-blocks", type=int, default=1)
+    parser.add_argument(
+        "--batch-size",
+        "--num-blocks",
+        dest="batch_size",
+        type=int,
+        default=1,
+        help=(
+            "Unified batch / block count, applied to every backend's native "
+            "batch flag for an apples-to-apples comparison: "
+            "UCCL --num-kvblocks, MORI --transfer-batch-size, "
+            "nixlbench --start_batch_size/--max_batch_size, "
+            "Mooncake transfer_engine_bench --batch_size. "
+            "Default 1 (per-message comparison). `--num-blocks` is a kept "
+            "for backward compatibility."
+        ),
+    )
     parser.add_argument("--device", choices=["cpu", "gpu"], default="gpu")
     parser.add_argument("--op-type", choices=["read", "write"], default="write")
     parser.add_argument("--source-root", default=str(DEFAULT_THIRDPARTY_DIR))
@@ -1069,18 +950,101 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument("--mori-backend", choices=["rdma", "xgmi"], default="rdma")
-    parser.add_argument("--mori-transfer-batch-size", type=int, default=1)
     parser.add_argument("--mori-xgmi-multiprocess", action="store_true")
     parser.add_argument("--nixlbench-bin", default="nixlbench")
-    parser.add_argument("--nixl-backend", default="UCX")
+    parser.add_argument(
+        "--nixl-backend",
+        default="LIBFABRIC",
+        help=(
+            "nixlbench --backend selection. Default LIBFABRIC because the "
+            "ROCm/HIP-built nixl in benchp2p:latest skips the UCX plugin "
+            "(its meson refuses to use the system UCX 1.12 missing "
+            "UCS_BIT_GET). Override with `--nixl-backend UCX` etc. on a "
+            "CUDA build with a newer UCX."
+        ),
+    )
     parser.add_argument("--nixl-etcd-endpoints", default=None)
     parser.add_argument("--nixl-start-etcd", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--nixl-device-list", default=None)
-    parser.add_argument("--mooncake-bench-bin", default="tebench")
+    parser.add_argument(
+        "--nixl-seg-type",
+        choices=["auto", "DRAM", "VRAM"],
+        default="auto",
+        help=(
+            "Override nixlbench --initiator_seg_type / --target_seg_type. "
+            "Default 'auto' follows --device (gpu->VRAM, cpu->DRAM). "
+            "On ROCm/HIP base images, nixlbench is built without HAVE_CUDA "
+            "and aborts with `VRAM not supported without CUDA or Neuron`; "
+            "pass `--nixl-seg-type DRAM` there to keep nixl in the run."
+        ),
+    )
+    parser.add_argument(
+        "--mooncake-bench-bin",
+        default="transfer_engine_bench",
+        help=(
+            "Mooncake bench binary. Defaults to `transfer_engine_bench` "
+            "(mooncake-transfer-engine/example/, the README-recommended "
+            "tool, shipped via the mooncake wheel and on PATH inside the "
+            "runtime image at /opt/venv/bin/transfer_engine_bench). The "
+            "older `tebench` (mooncake-transfer-engine/benchmark/) is "
+            "documented as a `prototype micro-benchmark` and its "
+            "metadata_type=p2p+rdma path is broken on ROCm/VRAM."
+        ),
+    )
     parser.add_argument("--mooncake-backend", choices=["classic", "tent"], default="tent")
-    parser.add_argument("--mooncake-xport-type", default="rdma")
+    parser.add_argument(
+        "--mooncake-xport-type",
+        default="rdma",
+        help=(
+            "transfer_engine_bench --protocol value (rdma|tcp|...). "
+            "Default rdma matches the README-recommended cross-node setup."
+        ),
+    )
+    parser.add_argument(
+        "--mooncake-threads",
+        type=int,
+        default=12,
+        help=(
+            "transfer_engine_bench --threads (initiator side). README "
+            "default is 12; multiple threads are needed to fully utilise "
+            "RDMA bandwidth because of CPU-side request prep overhead."
+        ),
+    )
     parser.add_argument("--mooncake-duration", type=int, default=5)
+    parser.add_argument(
+        "--mooncake-target-wait-seconds",
+        type=float,
+        default=90.0,
+        help=(
+            "How long rank>0 waits for the mooncake target segment file to "
+            "appear on the shared FS before failing. Defaults to 90 s; bump "
+            "this on NFS mounts where directory attribute caching (acdirmin "
+            "defaults to 30 s) can hide a freshly-written file from the "
+            "initiator side."
+        ),
+    )
     parser.add_argument("--uccl-script", default=None)
+    parser.add_argument(
+        "--uccl-sendrecv",
+        action="store_true",
+        help=(
+            "Force UCCL to use the legacy two-sided benchmark_uccl.py "
+            "(RDMA SEND/RECV). Default off: UCCL runs "
+            "benchmark_uccl_readwrite.py --mode {--op-type} so it shares "
+            "the same one-sided ULP as mori/nixl/mooncake. Only enable "
+            "when you specifically want UCCL's SEND/RECV cost."
+        ),
+    )
+    parser.add_argument(
+        "--uccl-no-lazy",
+        action="store_true",
+        help=(
+            "Disable benchmark_uccl_readwrite.py --lazy (the script will "
+            "ibv_reg_mr per iter instead of pre-registering). Off by "
+            "default; --lazy is what the README example uses for stable "
+            "small-size numbers."
+        ),
+    )
     parser.add_argument("--mori-script", default=None)
     parser.add_argument("--nixl-script", default=None)
     parser.add_argument("--mooncake-script", default=None)

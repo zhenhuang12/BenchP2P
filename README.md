@@ -1,228 +1,197 @@
 # BenchP2P
 
-BenchP2P provides a unified harness for comparing point-to-point bandwidth and
-latency across common P2P stacks:
+Unified harness for comparing point-to-point bandwidth and latency across
+four common P2P stacks, all running each backend's **official** benchmark
+inside the same container so the numbers are apples-to-apples:
 
-- MORI: `https://github.com/ROCm/mori.git`
-- Mooncake: `https://github.com/kvcache-ai/Mooncake.git`
-- UCCL: `https://github.com/uccl-project/uccl.git`
-- NIXL: `https://github.com/ai-dynamo/nixl.git`
+- **MORI**: <https://github.com/ROCm/mori.git>
+- **Mooncake**: <https://github.com/kvcache-ai/Mooncake.git>
+- **UCCL**: <https://github.com/uccl-project/uccl.git>
+- **NIXL**: <https://github.com/ai-dynamo/nixl.git>
 
-The harness clones these public repositories into `3rdparty/`, builds Python
-wheels and native benchmark binaries inside `docker.io/rocm/primus:v26.2`,
-runs each backend's *official* benchmark, and emits:
+A run produces, under `--output-dir`:
 
-- `p2p_results.csv`: per-size measurements
-- `p2p_summary.csv`: best bandwidth and best latency per backend
-- `p2p_results.md`: Markdown table
-- `p2p_metrics.json`: parsed metrics
-- `p2p_comparison.png`: bandwidth and latency chart
-- `logs/`: raw backend logs (one file per backend per rank)
+| File | Content |
+| --- | --- |
+| `logs/<backend>_rank<N>.log` | Raw stdout/stderr from each backend invocation |
+| `p2p_results.csv` | Per-(backend, size, batch) measurement |
+| `p2p_summary.csv` | Best bandwidth + best latency per backend |
+| `p2p_results.md` | Markdown table for PR / report |
+| `p2p_metrics.json` | Same data, JSON |
+| `p2p_comparison.png` | Bandwidth + latency chart (matplotlib) |
+
+---
 
 ## Layout
 
-```
-scripts/
-  build_wheel.sh             # shell: per-backend build (wheel + native binaries)
-  container_build_wheel.sh   # docker run + build_wheel.sh inside the runtime image
-  bench_p2p_compare.py       # `run` (per-rank, in container) + `report` (host-side aggregator)
-  container_bench_p2p.sh     # docker run + bench_p2p_compare.py
-  slurm_bench_p2p.sh         # srun N tasks of container_bench_p2p.sh + report on host
-```
-
 ```mermaid
 flowchart LR
-  user1[user] --> slurm[slurm_bench_p2p.sh]
-  slurm -->|srun per-task| container[container_bench_p2p.sh]
-  container -->|docker run| bench[bench_p2p_compare.py run]
-  bench --> backends["uccl / mori / tebench / nixlbench"]
-  slurm -->|after srun| report[bench_p2p_compare.py report]
-  report --> outputs["csv / md / png / json"]
+  subgraph build [Build the runtime image once]
+    bi[scripts/build_image.sh] --> dimg["benchp2p:latest<br/>(4 backends + harness)"]
+    sbi[scripts/slurm_build_image.sh] --> bi
+    sbi -. save .-> tar["_images/benchp2p.tar"]
+    tar --> sli[scripts/slurm_load_image.sh] --> nodes["docker load on bench nodes"]
+  end
 
-  user2[user] --> cbw[container_build_wheel.sh]
-  cbw -->|docker run| bw[build_wheel.sh]
-  bw --> wheels["3rdparty/wheelhouse/<backend>/*.whl + native binaries"]
+  subgraph bench [Run the benchmark]
+    sb[scripts/slurm_bench_p2p.sh] -- "srun N tasks" --> cb[scripts/container_bench_p2p.sh]
+    cb -- "docker run" --> bc["bench_p2p_compare.py run<br/>(per rank)"]
+    bc --> backs["uccl / mori / mooncake / nixl"]
+    sb -- "after srun" --> rep["bench_p2p_compare.py report<br/>(on submission host)"]
+    rep --> out["csv / md / png / json"]
+  end
+
+  build -. used by .-> bench
 ```
 
-## Official benchmark mapping
+```text
+scripts/
+  build_image.sh         # docker build of ./Dockerfile  -> benchp2p:latest
+  slurm_build_image.sh   # srun a fat node to run build_image.sh, optional --save-image tar
+  slurm_load_image.sh    # srun docker load on every bench node
+  bench_p2p_compare.py   # `run` (per rank) + `report` (host aggregator)
+  container_bench_p2p.sh # docker run + bench_p2p_compare.py
+  slurm_bench_p2p.sh     # srun N tasks + bench, then host-side report
+  backend/run_<name>.sh  # per-rank wrapper that invokes each backend's official benchmark
+```
 
-BenchP2P keeps the workload comparable by using the same message sizes,
-operation (`--op-type read|write`), batch size (`--num-blocks` or the matching
-backend batch flag), one initiator device, and one target device.
+Every entry point accepts `--help` and `--dry-run`. Site-specific helpers
+(`switch_apt_mirror.sh`, `build_wheel.sh`, `container_build_wheel.sh`) are
+kept for offline / GFW clusters and dev iteration; see their header
+comments.
 
-| Backend | Official benchmark entry | Native metrics parsed |
+---
+
+## Build
+
+Bake all four backends + the harness into one `benchp2p:latest` image so a
+bench run is just `docker run benchp2p:latest bench_p2p_compare run ...`,
+no per-run pip install.
+
+```bash
+# 0) populate submodules (Dockerfile builds with --skip-clone)
+git submodule update --init --recursive
+
+# 1a) Build directly on the current host
+bash scripts/build_image.sh
+
+# 1b) Build on a Slurm fat node and save a tar onto shared FS
+bash scripts/slurm_build_image.sh \
+  --nodelist useocpm2m-097-132 --time 02:00:00 --cpus-per-task 64 \
+  --save-image _images/benchp2p.tar
+
+# 2) Distribute the tar to every bench node (skip if you have a registry)
+bash scripts/slurm_load_image.sh \
+  --nodelist 'useocpm2m-097-[132,135]' --nodes 2
+```
+
+Build args (forward to `docker build` via `--build-arg`):
+
+| Arg | Default | Purpose |
 | --- | --- | --- |
-| UCCL | `3rdparty/uccl/p2p/benchmarks/benchmark_uccl.py` | log lines with `GB/s` and latency |
-| MORI | `3rdparty/mori/tests/python/io/benchmark.py` | MORI table: `Avg Bw (GB/s)`, `Avg Lat (us)` |
-| Mooncake | official `tebench` from `mooncake-transfer-engine/benchmark` | `BW (GB/S)`, `Avg Lat (us)` |
-| NIXL | official `nixlbench` from `nixl/benchmark/nixlbench` | `B/W (GB/Sec)`, `Avg Lat. (us)` |
+| `BACKENDS` | `mori,mooncake,uccl,nixl` | Subset of backends to build |
+| `JOBS` | `$(nproc)` | make/ninja parallelism |
+| `APT_PRESET` / `APT_MIRROR` | — | Switch APT inside the build container (e.g. `--apt-preset aliyun` for GFW clusters) |
+| `PIP_INDEX_URL` | — | Override pip index for the wheel install layer |
 
-NIXLBench uses ETCD for multi-process coordination. By default rank 0 starts a
-local ETCD server (looked up from `PATH`) and both ranks connect to
-`http://MASTER_ADDR:2379`. Use `--no-nixl-start-etcd --nixl-etcd-endpoints
-<url>` when ETCD is provided externally. Mooncake uses `tebench` in
-TENT/RDMA mode by default; pass `--mooncake-bench-bin <path>` if the binary
-is not on `PATH`.
+---
 
-For MORI's RDMA backend the harness automatically resolves `MASTER_ADDR`
-(hostname) to its IPv4 via `socket.getaddrinfo` before passing it as `--host`,
-because mori's TCP bootstrap can hit `Network is unreachable` on clusters
-where the bare hostname has no direct route. Other backends keep using
-`MASTER_ADDR` untouched.
+## Bench
 
-## Build the wheelhouse
-
-The default and recommended path is to build everything inside
-`docker.io/rocm/primus:v26.2`:
-
-```bash
-bash scripts/container_build_wheel.sh
-```
-
-That wraps `build_wheel.sh` with the standard ROCm/RDMA `docker run` flags,
-mounts the repo, and writes wheels under `3rdparty/wheelhouse/<backend>/`.
-
-`build_wheel.sh` does **not** just call `pip install`; it dispatches per
-backend to that project's own install/build flow:
-
-| Backend | Build path used |
-| --- | --- |
-| **mori** | `pip wheel <repo>` (mori is Python-only; no separate native binary) |
-| **uccl** | `make -j -f p2p/Makefile.rocm` (mirrors `uccl/build_inner.sh build_p2p`), stages `libuccl_p2p.so` and `p2p.*.so` into the `uccl/` package dir, renames cpython-tagged ABI to `.abi3.so` on Python>=3.12, then `pip wheel` |
-| **mooncake** | `Mooncake/dependencies.sh -y` (apt + Go + yalantinglibs) -> `cmake -B build -DUSE_HIP=ON -DWITH_TE=ON ...` -> `ninja` (produces `engine.so` + `tebench`) -> official `Mooncake/scripts/build_wheel.sh` (auditwheel-repaired wheel with binaries embedded) |
-| **nixl** | `meson setup nixl/build --prefix=<nixl-prefix>` + `ninja install` -> `meson setup benchmark/nixlbench/build -Dnixl_path=<nixl-prefix>` + `ninja` -> `pip wheel nixl` |
-
-Useful flags (forwarded to `build_wheel.sh` after `--`):
-
-```bash
-bash scripts/container_build_wheel.sh -- --backends mori,uccl
-bash scripts/container_build_wheel.sh -- --skip-clone --no-clean
-bash scripts/container_build_wheel.sh --pull -- --backends nixl --timeout 7200
-bash scripts/container_build_wheel.sh -- --skip-binaries        # python wheels only
-bash scripts/container_build_wheel.sh -- --skip-apt-deps        # skip Mooncake's apt step
-bash scripts/container_build_wheel.sh -- --jobs 32 --continue-on-error
-bash scripts/container_build_wheel.sh -- --nixl-prefix /opt/nixl-1.1
-```
-
-To build directly on the host (for local development) skip the container:
-
-```bash
-bash scripts/build_wheel.sh                         # all backends
-bash scripts/build_wheel.sh --backends mooncake     # one backend
-bash scripts/build_wheel.sh --dry-run --skip-clone  # preview commands
-```
-
-`build_wheel.sh` requires `jq`, `git`, `python3 + pip`, `cmake`, `ninja`,
-`make`, and `hipcc` on `PATH` (the rocm/primus image provides them all).
-For `mooncake` it also needs the apt deps installed by `dependencies.sh`
-(`libgflags-dev`, `libgoogle-glog-dev`, `libjsoncpp-dev`, `libgrpc++-dev`,
-...); pass `--skip-apt-deps` if your container is already provisioned. For
-`nixl` it additionally needs `meson` and the gRPC/protobuf dev packages.
-Inside the runtime container, `build_wheel.sh` writes `safe.directory=*` to
-git so bind-mounted host checkouts pass git's ownership check.
-
-## Run the benchmark
-
-The end-to-end path is `slurm -> container -> bench`:
+End-to-end Slurm command. The wrapper `srun`s 2 tasks (rank 0 = initiator,
+rank 1 = target), each `exec`s `container_bench_p2p.sh` which `docker run`s
+`bench_p2p_compare.py run`. After `srun` returns, the wrapper invokes
+`bench_p2p_compare.py report` on the submission host to aggregate logs.
 
 ```bash
 bash scripts/slurm_bench_p2p.sh \
   --partition amd-rccl --gres gpu:1 --time 00:30:00 \
-  --output-dir ~/bp2p-runs/full \
   -- \
   --backends mori,mooncake,uccl,nixl \
-  --size-min 256 --size-max 16M \
-  --iters 10 \
+  --op-type write \
+  --size-min 8 --size-max 16M \
+  --batch-size 128 \
+  --iters 100 \
+  --async-api \
+  --ib-hca mlx5_0,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_7,mlx5_8,mlx5_9 \
   --device gpu
 ```
 
-The wrapper builds an `srun --nodes=2 --ntasks=2 --ntasks-per-node=1` command
-that, on each task, derives `MASTER_ADDR / MASTER_PORT / RANK / WORLD_SIZE /
-LOCAL_RANK / LOCAL_WORLD_SIZE` and then `exec`s `container_bench_p2p.sh`.
-Inside the container, `bench_p2p_compare.py run` installs the wheelhouse,
-then runs each requested backend; logs land in
-`<output-dir>/logs/<backend>_rank<N>.log`. After `srun` returns, the wrapper
-runs `bench_p2p_compare.py report --output-dir <dir>` on the submission host
-to write the summary CSV/Markdown/PNG/JSON. The `report` step uses
-matplotlib (already available in `rocm/primus:v26.2`; on bare hosts run
-`pip install matplotlib` once).
+Use a **shared FS** for `--output-dir` (defaults to
+`<repo>/results/p2p_compare_<ts>`). Do NOT use `/tmp/...`: that is local to
+each compute node, and the post-srun `report` step on the login node will
+not see the per-rank logs.
 
-> Use a shared FS (`$HOME` over NFS, or a project filesystem) for
-> `--output-dir`. Do **not** use `/tmp/...`: that path is local to each
-> compute node and the post-srun `report` step on the login node will not
-> see the per-rank logs.
+### Core bench flags
 
-### Message-size selection
+| Flag | Default | Effect |
+| --- | --- | --- |
+| `--backends` | `mori,mooncake,uccl,nixl` | Subset to run |
+| `--op-type {read,write}` | `write` | RDMA op for **all four backends** (see ULP table below) |
+| `--sizes 256,1K,1M,...` *or* `--size-min/--size-max [--size-step-factor F]` | 256B–100MB list | Either explicit list (with `K/M/G` suffixes) or `ib_write_bw -a` style power-of-`F` sweep (default `F=2`) |
+| `--batch-size N` | `1` | Unified batch flag fanned out per backend (alias `--num-blocks`) |
+| `--iters N` | `10` | Iterations per size; bump to 100+ for stable small-size numbers |
+| `--async-api` | off | Use each backend's async path (recommended for peak-BW measurement) |
+| `--device {gpu,cpu}` | `gpu` | Buffer location |
+| `--ib-hca SPEC` | unset | NCCL-style HCA selector: `"a,b,c"` whitelist or `"^a,b"` exclude (UCCL is auto-clamped to 4 NICs by `run_uccl.sh` due to UCCL's compile-time `kNICContextNumber=4`) |
 
-Two equivalent ways to pick sizes:
+### `--op-type write` ⇒ everyone runs RDMA WRITE
+
+| Backend | Native invocation under `--op-type write` |
+| --- | --- |
+| **mooncake** | `transfer_engine_bench --operation write` |
+| **nixl** | `nixlbench --op_type WRITE` |
+| **mori** | `benchmark.py --op-type write` |
+| **uccl** | `benchmark_uccl_readwrite.py --mode write --lazy` (one-sided RDMA WRITE) |
+
+UCCL-specific escape hatches (rarely needed):
+
+- `--uccl-sendrecv` → use the legacy two-sided `benchmark_uccl.py` (RDMA SEND/RECV). Only useful when comparing UCCL's own SEND/RECV vs WRITE cost — **not** for cross-backend comparison.
+- `--uccl-no-lazy` → disable `benchmark_uccl_readwrite.py --lazy` (per-iter `ibv_reg_mr`).
+
+### `--batch-size N` fans out per backend
+
+| Backend | Native flag |
+| --- | --- |
+| UCCL | `--num-iovs N` (or `--num-kvblocks` under `--uccl-sendrecv`) |
+| MORI | `--transfer-batch-size N` (auto-adds `--enable-batch-transfer --enable-sess` when `N > 1`) |
+| nixlbench | `--start_batch_size N --max_batch_size N` |
+| Mooncake | `transfer_engine_bench --batch_size N` |
+
+### Report only (re-aggregate logs)
 
 ```bash
-# Explicit list (default behaviour, matches the old --sizes flag)
-... -- --sizes 256,1K,4K,64K,1M,16M,100M ...
+python3 scripts/bench_p2p_compare.py report --output-dir <existing run dir>
 
-# ib_write_bw -a style power-of-two sweep (overrides --sizes)
-... -- --size-min 256 --size-max 16M             # doubling, 17 sizes
-... -- --size-min 1K  --size-max 64M --size-step-factor 4   # x4 between sizes
-```
-
-`--size-min` / `--size-max` accept human-readable suffixes (`64`, `1K`, `256K`,
-`1M`, ...) and require both ends. The harness pre-expands the sweep, then
-each backend's loop iterates one size per invocation.
-
-### Other common variations
-
-```bash
-bash scripts/slurm_bench_p2p.sh --standalone-allocation \
-  --partition amd-rccl --gres gpu:1 --time 00:30:00 \
-  -- --backends mori,uccl --size-min 256 --size-max 512M --iters 50 --ib-hca mlx5_0
-
-# parse logs collected elsewhere
+# pull in extra logs from other runs into the same report
 python3 scripts/bench_p2p_compare.py report \
   --output-dir ~/bp2p-runs/full \
   --from-log mori=/path/to/extra_mori.log
 ```
 
-`slurm_bench_p2p.sh` forwards standard slurm selectors (`--partition`,
-`--account`, `--qos`, `--time`, `--constraint`, `--gres`, `--gpus-per-task`,
-`--cpus-per-task`, `--job-name`) and accepts `--extra-srun-args` for
-site-specific additions. Container-level flags (`--image`, `--docker-bin`,
-`--container-python`, `--pull`, `--mount-home`, `--extra-mount`,
-`--extra-docker-args`) are forwarded to `container_bench_p2p.sh`. Use
-`--standalone-allocation` to make srun ignore the surrounding
-salloc/sbatch and request a fresh allocation matching `--nodes / --ntasks`
-(implemented via `env -u SLURM_JOB_ID -u SLURM_NODELIST ...`).
+---
 
-## Generated docker invocation
+## Common recipes
 
-`container_build_wheel.sh` and `container_bench_p2p.sh` both follow the
-ROCm/RDMA pattern:
+```bash
+# 1) Cross-backend RDMA WRITE comparison, single NIC, full size sweep
+bash scripts/slurm_bench_p2p.sh \
+  --partition amd-rccl --gres gpu:1 --time 00:30:00 \
+  -- --size-min 256 --size-max 1G \
+     --op-type write \
+     --batch-size 1 --iters 100 --async-api \
+     --ib-hca mlx5_0
 
+# 2) Compare RDMA WRITE vs READ (two runs into different output dirs)
+bash scripts/slurm_bench_p2p.sh -- --op-type write --output-dir results/write/
+bash scripts/slurm_bench_p2p.sh -- --op-type read  --output-dir results/read/
+
+# 3) Build the image on a fat node, distribute, then run on a different pair
+bash scripts/slurm_build_image.sh \
+  --nodelist useocpm2m-097-132 --time 02:00:00 --cpus-per-task 64 \
+  --save-image _images/benchp2p.tar
+bash scripts/slurm_load_image.sh \
+  --nodelist 'useocpm2m-097-[132,135]' --nodes 2
+bash scripts/slurm_bench_p2p.sh --nodelist 'useocpm2m-097-[132,135]' \
+  -- --size-min 256 --size-max 1G --batch-size 1 --async-api
 ```
-docker run --rm --ipc=host --network=host \
-  --device=/dev/kfd --device=/dev/dri --device=/dev/infiniband \
-  --cap-add=SYS_PTRACE --cap-add=CAP_SYS_ADMIN \
-  --security-opt seccomp=unconfined --group-add video --privileged \
-  --workdir <repo> -v <repo>:<repo> [...] <image> bash -lc <inner-cmd>
-```
-
-`container_bench_p2p.sh` additionally `--env`-passes
-`MASTER_ADDR / MASTER_PORT / RANK / WORLD_SIZE / LOCAL_RANK /
-LOCAL_WORLD_SIZE / SLURM_*`, and auto-mounts any `--output-dir`,
-`--source-root`, `--wheelhouse`, or `--manifest` path that lives outside the
-repo so the artifacts survive container teardown.
-
-## Notes
-
-- All entry points support `--help`. `--dry-run` prints commands without
-  executing them; the slurm wrapper additionally prints the post-srun
-  `report` command for inspection.
-- Rank 0 acts as server/initiator and rank 1 acts as client/target where the
-  backend needs explicit roles (mooncake `tebench`, nixl `nixlbench`).
-- MORI defaults to `--mori-backend rdma` with two ranks. Use
-  `--mori-backend xgmi` for single-node GPU-to-GPU XGMI testing.
-- MORI's `benchmark.py` requires integer-byte `--buffer-size`; the harness
-  converts every sweep size with `parse_size()` before passing it through, so
-  `--sizes 1K,1M,...` and `--size-min 1K --size-max 1M` work transparently.
-- MORI's published IO examples often use batched transfers; this harness
-  defaults to `--mori-transfer-batch-size 1` for a per-transfer comparison.
-  Set it to `128` if you want to mirror that MORI benchmark style.

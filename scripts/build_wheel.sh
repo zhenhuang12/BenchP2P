@@ -91,7 +91,7 @@ log() { printf '[build_wheel] %s\n' "$*" >&2; }
 die() { printf '[build_wheel] ERROR: %s\n' "$*" >&2; exit 1; }
 
 run() {
-  printf '+ %s\n' "$(printf '%q ' "$@")"
+  printf '+ %s\n' "$(printf '%q ' "$@")" >&2
   if [[ "${DRY_RUN}" == "1" ]]; then
     return 0
   fi
@@ -103,7 +103,7 @@ run() {
 }
 run_in() {
   local cwd="$1"; shift
-  printf '+ cd %s && %s\n' "${cwd}" "$(printf '%q ' "$@")"
+  printf '+ cd %s && %s\n' "${cwd}" "$(printf '%q ' "$@")" >&2
   if [[ "${DRY_RUN}" == "1" ]]; then
     return 0
   fi
@@ -121,7 +121,7 @@ run_in_sh() {
   # inside the target cwd.
   local cwd="$1"; shift
   local cmd="$*"
-  printf '+ cd %s && %s\n' "${cwd}" "${cmd}"
+  printf '+ cd %s && %s\n' "${cwd}" "${cmd}" >&2
   if [[ "${DRY_RUN}" == "1" ]]; then
     return 0
   fi
@@ -197,6 +197,11 @@ log "Jobs:        ${JOBS}"
 # --------------------------------------------------------------- common ---
 
 ensure_checkout() {
+  # IMPORTANT: stdout is reserved for the final `echo "${checkout}"` so the
+  # caller can capture it via $(ensure_checkout ...). Every side-effect
+  # command's stdout (git fetch/checkout/submodule and the run_in `+` trace)
+  # is funneled to stderr below; otherwise their output would be
+  # concatenated into the captured "checkout" path.
   local name="$1" repo="$2" ref="$3" path="$4"
   local checkout="${THIRDPARTY_DIR}/${path}"
   if [[ "${SKIP_CLONE}" == "1" ]]; then
@@ -204,17 +209,19 @@ ensure_checkout() {
     echo "${checkout}"
     return 0
   fi
-  if [[ ! -e "${checkout}" ]]; then
-    run_in "${THIRDPARTY_DIR}" git clone --recursive "${repo}" "${path}"
-  elif [[ -d "${checkout}/.git" ]]; then
-    run_in "${checkout}" git fetch --tags origin
-  else
-    die "${checkout} exists but is not a git checkout"
-  fi
-  if [[ -n "${ref}" && "${ref}" != "null" ]]; then
-    run_in "${checkout}" git checkout "${ref}"
-  fi
-  run_in "${checkout}" git submodule update --init --recursive
+  {
+    if [[ ! -e "${checkout}" ]]; then
+      run_in "${THIRDPARTY_DIR}" git clone --recursive "${repo}" "${path}"
+    elif [[ -d "${checkout}/.git" ]]; then
+      run_in "${checkout}" git fetch --tags origin
+    else
+      die "${checkout} exists but is not a git checkout"
+    fi
+    if [[ -n "${ref}" && "${ref}" != "null" ]]; then
+      run_in "${checkout}" git checkout "${ref}"
+    fi
+    run_in "${checkout}" git submodule update --init --recursive
+  } >&2
   echo "${checkout}"
 }
 
@@ -345,25 +352,51 @@ build_one_mooncake() {
       fi
     fi
 
-    log "==> mooncake: cmake configure (HIP, transfer-engine + tebench)"
+    log "==> mooncake: cmake configure (transfer-engine + transfer_engine_bench)"
+    # Match Mooncake's official release-non-cuda.yaml CI template:
+    #   cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+    #            -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release
+    # Plus our project-specific overrides:
+    #   -DBUILD_SHARED_LIBS=ON      so libtransfer_engine.so is staged
+    #   -DBUILD_EXAMPLES=ON         (default ON) -> transfer_engine_bench
+    #   -DBUILD_UNIT_TESTS=OFF      skip gtest build
+    #   -DUSE_ETCD=OFF / -DSTORE_USE_ETCD=OFF / -DUSE_HTTP=OFF
+    #                              we use --metadata_server=P2PHANDSHAKE,
+    #                              no centralized metadata service needed
+    #   -DWITH_STORE=OFF / -DWITH_P2P_STORE=OFF
+    #                              skip the optional store component
+    #
+    # -DUSE_HIP=ON  (EXPERIMENTAL, AMD GPU support via HIP/ROCm)
+    #   Pulled in via mooncake-common/common.cmake:67 (option) and
+    #   mooncake-transfer-engine/src/transport/CMakeLists.txt:45 (compiles
+    #   src/transport/hip_transport/*.cpp). Requires /opt/rocm to be present
+    #   (find_package(HIP REQUIRED) hard-pins CMAKE_PREFIX_PATH to
+    #   /opt/rocm/lib/cmake), which is satisfied by our rocm/primus:v26.2
+    #   base image.
+    log "    NOTE: building with -DUSE_HIP=ON (AMD/ROCm). Untested upstream;"
     run cmake -S "${checkout}" -B "${checkout}/build" -G Ninja \
       -DCMAKE_BUILD_TYPE=Release \
-      -DUSE_HIP=ON \
       -DBUILD_SHARED_LIBS=ON \
-      -DWITH_TE=ON \
+      -DBUILD_EXAMPLES=ON \
+      -DBUILD_UNIT_TESTS=OFF \
+      -DUSE_CUDA=OFF \
+      -DUSE_HIP=ON \
+      -DUSE_HTTP=OFF \
+      -DUSE_ETCD=OFF \
+      -DSTORE_USE_ETCD=OFF \
       -DWITH_STORE=OFF \
       -DWITH_STORE_RUST=OFF \
-      -DWITH_RUST_EXAMPLE=OFF \
       -DWITH_P2P_STORE=OFF \
-      -DBUILD_UNIT_TESTS=OFF \
-      -DUSE_ETCD=OFF
-    log "==> mooncake: ninja build (engine.so + tebench)"
+      -DWITH_RUST_EXAMPLE=OFF
+    log "==> mooncake: ninja build (engine.so + transfer_engine_bench)"
     run cmake --build "${checkout}/build" -j "${JOBS}"
 
     if [[ "${DRY_RUN}" != "1" ]]; then
-      local tebench="${checkout}/build/mooncake-transfer-engine/benchmark/tebench"
-      [[ -x "${tebench}" ]] || die "mooncake: tebench not produced at ${tebench}"
-      log "    tebench: ${tebench} ($(stat -c%s "${tebench}") bytes)"
+      # Mooncake's official scripts/build_wheel.sh expects this path
+      # (line 104: build/mooncake-transfer-engine/example/transfer_engine_bench).
+      local te_bench="${checkout}/build/mooncake-transfer-engine/example/transfer_engine_bench"
+      [[ -x "${te_bench}" ]] || die "mooncake: transfer_engine_bench not produced at ${te_bench}"
+      log "    transfer_engine_bench: ${te_bench} ($(stat -c%s "${te_bench}") bytes)"
     fi
   fi
 
@@ -415,7 +448,18 @@ build_one_nixl() {
 
     log "==> nixl: meson setup core (prefix=${NIXL_PREFIX})"
     [[ -d "${nixl_build}" ]] && run rm -rf "${nixl_build}"
-    run meson setup "${nixl_build}" "${checkout}" --prefix="${NIXL_PREFIX}" --buildtype=release
+    # Disable plugins we can't reliably build on rocm/primus base:
+    #   UCX  - rocm/primus's UCX 1.12.x predates UCS_BIT_GET (used by
+    #          nixl 1.1+ ucx_utils.cpp::warnAboutHardwareSupportMismatch).
+    #          BenchP2P doesn't use this transport (mori/uccl/mooncake
+    #          handle the actual wire), so dropping it avoids a hard
+    #          build failure without losing functionality we need.
+    # Override with NIXL_DISABLE_PLUGINS env var if a different set is
+    # required for a non-ROCm base image.
+    : "${NIXL_DISABLE_PLUGINS:=UCX}"
+    run meson setup "${nixl_build}" "${checkout}" \
+      --prefix="${NIXL_PREFIX}" --buildtype=release \
+      -Ddisable_plugins="${NIXL_DISABLE_PLUGINS}"
     log "==> nixl: ninja install core (provides nixl.pc for nixlbench)"
     run ninja -C "${nixl_build}" -j "${JOBS}"
     run ninja -C "${nixl_build}" install

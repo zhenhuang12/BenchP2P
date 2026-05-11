@@ -1,0 +1,73 @@
+# Anything not needed by Dockerfile's COPY context. Keeping the build
+# context small speeds up `docker build` (the daemon tarballs the entire
+# context up-front) and avoids accidentally shipping host build trees /
+# wheelhouses into the image.
+
+# Repo bookkeeping. We exclude every .git directory at any depth: the
+# image build itself doesn't need git history, and uccl/mori .git dirs
+# alone weigh in at >1.5 GB which would balloon the build context tarball.
+# Submodules of each backend must therefore be pre-populated on the host
+# (run `git submodule update --init --recursive` once before
+# `docker build`); otherwise mooncake/mori build steps will fail trying
+# to pull yalantinglibs / spdlog / msgpack from a missing .git.
+**/.git/
+.git
+.github
+.gitignore
+.gitmodules
+.dockerignore
+Dockerfile
+
+# Editor / OS clutter
+.vscode
+.idea
+.DS_Store
+*.swp
+*.swo
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Build artifacts that get regenerated inside the image. We deliberately
+# leave them out so the builder stage starts from a clean slate -- this
+# avoids dragging stale CMakeCache.txt files (often with absolute host
+# paths or a different gfx arch) into the image.
+3rdparty/wheelhouse/
+3rdparty/*/build/
+3rdparty/*/dist/
+3rdparty/*/_skbuild/
+3rdparty/*/wheelhouse/
+3rdparty/*/python/*/_jit-sources/
+3rdparty/*/p2p/build/
+3rdparty/Mooncake/mooncake-wheel/dist/
+3rdparty/Mooncake/mooncake-wheel/build/
+3rdparty/Mooncake/extern/*/build/
+3rdparty/Mooncake/extern/*/_skbuild/
+3rdparty/nixl/benchmark/nixlbench/build/
+3rdparty/uccl/p2p/build/
+
+# Catch-all for any nested CMake/setuptools build trees the patterns above
+# might miss (e.g. submodule-of-submodule). Prevents stale CMakeCache.txt
+# files baked from host paths (/home/...) from leaking into the image and
+# breaking inner-container cmake runs.
+3rdparty/**/CMakeCache.txt
+3rdparty/**/CMakeFiles/
+
+# Backend per-build .so / object trees that bloat context.
+3rdparty/*/*.so
+3rdparty/*/*.o
+3rdparty/*/*.a
+3rdparty/uccl/p2p/*.so
+3rdparty/uccl/p2p/*.o
+3rdparty/uccl/uccl/*.so
+3rdparty/uccl/uccl/lib/
+
+# Bench outputs the user might keep in the repo
+bp2p-runs/
+*.log

@@ -37,6 +37,8 @@ MOUNT_HOME="0"
 DRY_RUN="0"
 EXTRA_MOUNTS=()
 EXTRA_DOCKER_ARGS=""
+APT_MIRROR=""
+APT_PRESET=""
 INNER_ARGS=()
 
 usage() {
@@ -58,6 +60,11 @@ Container options:
   --mount-home             Mount $HOME at /root/home inside the container
   --extra-mount SRC:DST    Extra bind mount, repeatable
   --extra-docker-args STR  Extra args appended to docker run (parsed with shlex)
+  --apt-mirror URL         Switch APT to this mirror inside the container
+                           before build_wheel.sh runs (uses
+                           scripts/switch_apt_mirror.sh)
+  --apt-preset NAME        Preset shorthand for --apt-mirror (tuna, aliyun,
+                           ustc, huawei, 163, oracle-iad/-phx/-fra, default)
   --dry-run                Print the docker command without executing it
   -h, --help               Show this help
 
@@ -82,6 +89,8 @@ while [[ $# -gt 0 ]]; do
     --mount-home) MOUNT_HOME="1"; shift ;;
     --extra-mount) EXTRA_MOUNTS+=("$2"); shift 2 ;;
     --extra-docker-args) EXTRA_DOCKER_ARGS="$2"; shift 2 ;;
+    --apt-mirror) APT_MIRROR="$2"; shift 2 ;;
+    --apt-preset) APT_PRESET="$2"; shift 2 ;;
     --dry-run) DRY_RUN="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     --) shift; INNER_ARGS+=("$@"); break ;;
@@ -128,6 +137,29 @@ add_mount_if_external() {
 add_mount_if_external "${INNER_THIRDPARTY}"
 add_mount_if_external "${INNER_WHEELHOUSE}"
 
+# Paths the inner build is known to write to. After build_wheel.sh exits we
+# chown these back to the invoking host user so subsequent host-side runs
+# (and host-side `bash scripts/build_wheel.sh`) don't trip on root-owned
+# build artifacts -- e.g. mori's setup.py blows up trying to rmtree
+# build/CMakeFiles/pkgRedirects/ when those files were created by root in a
+# previous container build. User-provided --extra-mount paths are
+# intentionally NOT chowned (we don't presume to touch arbitrary mounts).
+HOST_UID="$(id -u)"
+HOST_GID="$(id -g)"
+CHOWN_PATHS=("${REPO_ROOT}")
+maybe_add_chown_path() {
+  local p="$1"
+  [[ -z "${p}" ]] && return
+  local abs
+  abs="$(cd "$(dirname "${p}")" 2>/dev/null && pwd)/$(basename "${p}")" || true
+  [[ -n "${abs}" ]] || return
+  if [[ "${abs}" != "${REPO_ROOT}"* ]]; then
+    CHOWN_PATHS+=("${abs}")
+  fi
+}
+maybe_add_chown_path "${INNER_THIRDPARTY}"
+maybe_add_chown_path "${INNER_WHEELHOUSE}"
+
 for m in "${EXTRA_MOUNTS[@]}"; do
   DOCKER+=(-v "${m}")
 done
@@ -144,8 +176,35 @@ INNER_CMD=(
   --python "${CONTAINER_PYTHON}"
 )
 INNER_CMD+=("${INNER_ARGS[@]}")
+INNER_BUILD="$(printf '%q ' "${INNER_CMD[@]}")"
 
-DOCKER+=("${IMAGE}" bash -lc "$(printf '%q ' "${INNER_CMD[@]}")")
+# Optional APT mirror switch. Runs scripts/switch_apt_mirror.sh inside the
+# container before build_wheel.sh, so mooncake's apt-based dependencies.sh
+# step can reach packages on clusters where Canonical's archives are
+# unreachable. The script itself backs up /etc/apt's original sources so
+# this is non-destructive within the ephemeral container.
+APT_PREFIX=""
+if [[ -n "${APT_MIRROR}" || -n "${APT_PRESET}" ]]; then
+  APT_CMD=(bash "${REPO_ROOT}/scripts/switch_apt_mirror.sh")
+  [[ -n "${APT_PRESET}" ]] && APT_CMD+=(--preset "${APT_PRESET}")
+  [[ -n "${APT_MIRROR}" ]] && APT_CMD+=(--mirror "${APT_MIRROR}")
+  APT_PREFIX="$(printf '%q ' "${APT_CMD[@]}")"$'\n'
+fi
+
+# Wrap the build command so that on EXIT (success, failure, or signal) we
+# chown each tracked path back to the host UID:GID. The chown is a no-op
+# when the caller already runs the container as the host user.
+INNER_SH=$'__chown_back() {\n'
+for p in "${CHOWN_PATHS[@]}"; do
+  INNER_SH+="  chown -R ${HOST_UID}:${HOST_GID} $(printf '%q' "${p}") 2>/dev/null || true"$'\n'
+done
+INNER_SH+="  echo \"[container_build_wheel] restored ownership of build artifacts to ${HOST_UID}:${HOST_GID}\" >&2"$'\n'
+INNER_SH+=$'}\n'
+INNER_SH+=$'trap __chown_back EXIT\n'
+INNER_SH+="${APT_PREFIX}"
+INNER_SH+="${INNER_BUILD}"
+
+DOCKER+=("${IMAGE}" bash -lc "${INNER_SH}")
 
 echo "[container_build_wheel] docker command:"
 printf '  %q' "${DOCKER[@]}"
